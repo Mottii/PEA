@@ -93,6 +93,29 @@ def test_normalize_homoglyphs_and_unit_parsing() -> None:
     assert eng_val == pytest.approx(5.0)
     assert eng_unit == "mH"
 
+    # Default unit extraction (unit_pattern=None) must never grab letters from labels/prefixes
+    labeled_cases: list[tuple[str, float | None, str | None]] = [
+        ("B = 50,0 мкТл", 50.0, "мкТл"),
+        ("В = -60,32 мкТл", -60.32, "мкТл"),
+        ("Магнитная индукция 50,0 мкТл", 50.0, "мкТл"),
+        ("Сила тока I = 5,0 мА", 5.0, "мА"),
+        ("Частота 2450 с⁻¹", 2450.0, "с⁻¹"),
+        ("f, с-1", None, "с-1"),
+        ("1,25e-3 мТл", 0.00125, "мТл"),
+        ("1,25е-3 мТл", 0.00125, "мТл"),
+        ("T = 250 мс", 250.0, "мс"),
+        ("B = 50,0", 50.0, None),
+    ]
+    for raw_text, exp_val, exp_unit in labeled_cases:
+        got_val, got_unit = parse_numeric_and_unit(raw_text, parse_mode="float")
+        if exp_val is None:
+            assert got_val is None, f"{raw_text!r}: expected None, got {got_val!r}"
+        else:
+            assert got_val == pytest.approx(exp_val), (
+                f"{raw_text!r}: expected {exp_val}, got {got_val!r}"
+            )
+        assert got_unit == exp_unit, f"{raw_text!r}: expected unit {exp_unit!r}, got {got_unit!r}"
+
 
 def test_prepare_crop_pad_scale_and_validation() -> None:
     img = Image.new("RGB", (200, 100), color=(20, 40, 60))
@@ -342,6 +365,34 @@ def test_macos_vision_success_and_error_fallback(tmp_path: Path) -> None:
         assert res.backend == "rapidocr"
         assert backend.fallback_count == 1
         assert fallback.calls == ["rec_only"]
+
+    # Verbose stderr (>100 KB) must not deadlock the helper pipe
+    chatty_helper = tmp_path / "chatty_helper.py"
+    chatty_helper.write_text(
+        "import json, sys\n"
+        "for line in sys.stdin:\n"
+        "    req = json.loads(line)\n"
+        "    if req.get('cmd') == 'quit': break\n"
+        "    sys.stderr.write('W' * 120000 + '\\n')\n"
+        "    sys.stderr.flush()\n"
+        "    print(json.dumps({\n"
+        "        'ok': True, 'elapsed_ms': 2.0,\n"
+        "        'boxes': [{'text': '42,5', 'confidence': 0.99,\n"
+        "                   'bbox_px': [0, 0, 40, 20], 'bbox_norm': [0.0, 0.0, 1.0, 1.0]}],\n"
+        "        'error': None,\n"
+        "    }), flush=True)\n",
+        encoding="utf-8",
+    )
+    with MacOsVisionOcrBackend(
+        cfg,
+        fallback=fallback,  # type: ignore[arg-type]
+        helper_command=[sys.executable, "-u", str(chatty_helper)],
+        timeout_s=2.0,
+    ) as backend:
+        res = backend.recognize(img, mode="det_rec")
+        assert res.backend == "macos_vision"
+        assert res.boxes[0].text == "42,5"
+        assert backend.fallback_count == 0
 
 
 def test_macos_vision_swift_source_exists() -> None:

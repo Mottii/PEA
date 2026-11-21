@@ -147,7 +147,7 @@ class MacOsVisionOcrBackend:
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
         )
@@ -175,9 +175,11 @@ class MacOsVisionOcrBackend:
         mode: OcrMode,
         reason: str,
     ) -> OcrResult:
-        self.fallback_count += 1
-        self.last_fallback_reason = reason
-        return self._get_fallback().recognize(image, mode=mode)
+        with self._lock:
+            self.fallback_count += 1
+            self.last_fallback_reason = reason
+            fallback = self._get_fallback()
+        return fallback.recognize(image, mode=mode)
 
     def _send_and_receive(self, payload: dict[str, Any]) -> dict[str, Any]:
         proc, out_q = self._ensure_child()
@@ -268,7 +270,8 @@ class MacOsVisionOcrBackend:
                 boxes=boxes,
             )
         except Exception as exc:
-            self._kill_child()
+            with self._lock:
+                self._kill_child()
             return self._fallback_recognize(pil_img, mode=mode, reason=str(exc))
         finally:
             if tmp_path is not None:

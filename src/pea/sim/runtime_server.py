@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import html
+import json
 import mimetypes
+import socket
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -51,6 +53,11 @@ def render_ruffle_index_html(
     """Build auto-sized loopback HTML locking ``<ruffle-player>`` to ``(0, header_h, W, H)``."""
     safe_name = html.escape(swf_filename, quote=True)
     url_name = quote(swf_filename)
+    js_sim_url = json.dumps(f"/sim/{url_name}", ensure_ascii=False).replace("</", "<\\/")
+    js_ready_text = json.dumps(
+        f"{swf_filename} — ready ({meta.stage_width}x{meta.stage_height})",
+        ensure_ascii=False,
+    ).replace("</", "<\\/")
     w = meta.stage_width
     h = meta.stage_height
     hh = header_height_px
@@ -131,12 +138,12 @@ def render_ruffle_index_html(
         player.style.height = "{h}px";
         container.appendChild(player);
         const loadResult = player.load({{
-          url: "/sim/{url_name}",
+          url: {js_sim_url},
           allowScriptAccess: false,
           allowNetworking: "none",
         }});
         Promise.resolve(loadResult).then(() => {{
-          statusEl.textContent = "{safe_name} — ready ({w}x{h})";
+          statusEl.textContent = {js_ready_text};
           window.__peaReady = true;
         }}).catch((err) => {{
           window.__peaError = String(err);
@@ -158,6 +165,10 @@ class _PeaThreadingHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
 
+class _PeaThreadingHTTPServerV6(_PeaThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+
 class SimRuntimeServer:
     """Loopback HTTP server with anti-DNS-rebinding ``Host`` checks and path confinement."""
 
@@ -175,7 +186,11 @@ class SimRuntimeServer:
         if header_height_px < 0:
             raise ValueError(f"header_height_px must be >= 0; got {header_height_px}")
 
-        self._host = host
+        normalized_host = host.strip().lower()
+        if normalized_host.startswith("[") and normalized_host.endswith("]"):
+            normalized_host = normalized_host[1:-1]
+
+        self._host = normalized_host
         self._requested_port = port
         self._header_height_px = header_height_px
 
@@ -412,13 +427,17 @@ class SimRuntimeServer:
                 self._handle(head_only=True)
 
             def do_POST(self) -> None:  # noqa: N802
+                self.close_connection = True
                 self._send_text_error(
                     HTTPStatus.METHOD_NOT_ALLOWED,
                     "Method Not Allowed",
                     head_only=False,
                 )
 
-        httpd = _PeaThreadingHTTPServer((self._host, self._requested_port), _Handler)
+        server_cls = (
+            _PeaThreadingHTTPServerV6 if ":" in self._host else _PeaThreadingHTTPServer
+        )
+        httpd = server_cls((self._host, self._requested_port), _Handler)
         self._httpd = httpd
         self._bound_port = int(httpd.server_address[1])
         thread = threading.Thread(

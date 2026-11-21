@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import http.client
 import io
 import json
@@ -42,6 +43,7 @@ from pea.sim import (
     sim_watch,
     values_match,
 )
+from pea.sim.engine import _is_route_url_allowed
 from pea.workspace import WorkspaceManager
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -148,6 +150,30 @@ def test_runtime_server_html5_dir_mode_confinement(tmp_path: Path) -> None:
 
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
         conn.request("GET", "/../secret.txt", headers={"Host": f"127.0.0.1:{port}"})
+        resp = conn.getresponse()
+        resp.read()
+        assert resp.status == 403
+        conn.close()
+
+
+@pytest.mark.parametrize("ipv6_host", ["::1", "[::1]"])
+def test_runtime_server_ipv6_loopback_and_host_guard(ipv6_host: str) -> None:
+    swf_path = SIMS_DIR / "m96220.swf"
+    server = SimRuntimeServer(host=ipv6_host, port=0, header_height_px=39)
+    server.configure_swf(swf_path, RUFFLE_DIR)
+    with server:
+        origin = server.origin
+        assert origin.startswith("http://[::1]:")
+        port = server.port
+
+        r = httpx.get(f"{origin}/index.html")
+        assert r.status_code == 200
+        assert "/sim/m96220.swf" in r.text
+
+        conn = http.client.HTTPConnection("::1", port, timeout=3)
+        conn.putrequest("GET", "/index.html", skip_host=True)
+        conn.putheader("Host", f"evil.com:{port}")
+        conn.endheaders()
         resp = conn.getresponse()
         resp.read()
         assert resp.status == 403
@@ -880,10 +906,200 @@ async def test_simulator_manager_blocks_unallowlisted_external_url(tmp_path: Pat
         allowed_origins=(),
     )
     mgr = SimulatorManager(cfg)
+    assert mgr is not None
     with pytest.raises(PermissionError, match="not allowlisted"):
         await mgr.open(url="https://phet.colorado.edu/sims/html/rlc.html")
     with pytest.raises(ValueError, match="Provide exactly one"):
         await mgr.open()
+
+    # External URL mode (loopback_origin=None) must allow ONLY allowlisted origins and NEVER
+    # leak access to the local viewer_origin.
+    cfg_ext = PeaConfig(
+        project_root=REPO_ROOT,
+        local_assets_dir=REPO_ROOT / "local_assets",
+        runs_dir=tmp_path / "runs_ext",
+        profiles_dir=tmp_path / "profiles_ext",
+        allowed_origins=("https://phet.colorado.edu",),
+    )
+    assert _is_route_url_allowed("https://phet.colorado.edu/sims/rlc.html", None, cfg_ext) is True
+    assert _is_route_url_allowed("blob:https://phet.colorado.edu/abc", None, cfg_ext) is True
+    assert _is_route_url_allowed(f"{cfg_ext.viewer_origin}/api/runs", None, cfg_ext) is False
+    assert _is_route_url_allowed("https://evil.example.com/", None, cfg_ext) is False
+
+
+async def test_session_edge_cases_retry_failure_cancel_and_control_type(tmp_path: Path) -> None:
+    # 1. sweep() retry must NOT double-click an unverified checkbox/button in fixed_controls
+    prof = _build_lab5_profile()
+    prof.controls["mode_toggle"] = ControlSpec(
+        name="mode_toggle",
+        kind="checkbox",
+        click_xy=(100, 100),
+    )
+    page = _MockSimPage(
+        initial_state={"R": 3.2, "omega": 2500.0},
+        profile=prof,
+        readout_fn=_rlc_readout,
+        drop_first_set_for={("omega", 2450.0)},
+    )
+    sess = _make_session(
+        tmp_path / "retry_checkbox",
+        profile=prof,
+        page=page,
+        ocr=_MockOcrBackend(page, prof),
+    )
+    res = await sess.sweep(
+        SweepSpec(
+            fixed_controls={"R": 3.2, "mode_toggle": 1},
+            axes=[SweepAxis(control="omega", values=[2450])],
+            readouts=["uc_over_u"],
+            settle_ms=0,
+            verify_controls=True,
+        )
+    )
+    assert res["controls_matched_all"] is True
+    assert [e for e in page.events if e == ("click", 100, 100)] == [("click", 100, 100)]
+
+    # 2. act(action="type", control=...) clicks the control before typing
+    await sess.act(
+        [
+            ActionStep(action="type", control="omega", text="2400", select_all=True),
+            ActionStep(action="key", key="Enter"),
+        ]
+    )
+    assert page.state["omega"] == pytest.approx(2400.0)
+
+    # 3. search_extremum() retries mismatched verified fixed_controls too
+    prof_fix = _build_lab5_profile()
+    page_fix = _MockSimPage(
+        initial_state={"R": 3.0, "omega": 2445.0},
+        profile=prof_fix,
+        readout_fn=_rlc_readout,
+        drop_first_set_for={("R", 5.0)},
+    )
+    sess_fix = _make_session(
+        tmp_path / "search_fix_retry",
+        profile=prof_fix,
+        page=page_fix,
+        ocr=_MockOcrBackend(page_fix, prof_fix),
+    )
+    res_fix = await sess_fix.search_extremum(
+        SearchSpec(
+            mode="max",
+            fixed_controls={"R": 5.0},
+            sweep_control="omega",
+            readout="uc_over_u",
+            start=2445.0,
+            step=-1.0,
+            max_steps=2,
+            settle_ms=0,
+            verify_controls=True,
+        )
+    )
+    assert res_fix.trace[0].observed_settings["R"] == pytest.approx(5.0)
+    assert res_fix.trace[0].controls_matched is True
+
+    # 4. search_extremum() failure sets workspace phase='failed' & partial-readings status='failed'
+    page_fail = _MockSimPage(
+        initial_state={"R": 5.0, "omega": 2445.0},
+        profile=prof_fix,
+        readout_fn=_rlc_readout,
+    )
+    sess_fail = _make_session(
+        tmp_path / "search_fail",
+        profile=prof_fix,
+        page=page_fail,
+        ocr=_MockOcrBackend(page_fail, prof_fix),
+    )
+    with pytest.raises(RuntimeError, match="not reached"):
+        await sess_fail.search_extremum(
+            SearchSpec(
+                mode="threshold",
+                sweep_control="omega",
+                readout="uc_over_u",
+                start=2445.0,
+                step=-1.0,
+                max_steps=3,
+                target_value=999.0,
+                settle_ms=0,
+            )
+        )
+    assert sess_fail.workspace.read_status().phase == "failed"
+    assert sess_fail.workspace.read_status().error is not None
+    fail_partial = json.loads(
+        (sess_fail.workspace.root / "partial-readings.json").read_text("utf-8")
+    )
+    assert fail_partial["status"] == "failed"
+    assert fail_partial["count"] == 3
+    assert sess_fail.workspace.verify_provenance().ok is True
+
+    # 4b. sweep() mid-run error preserves partial evidence, hashes provenance, and sets failed
+    page_boom = _MockSimPage(
+        initial_state={"R": 5.0, "omega": 2500.0},
+        profile=prof_fix,
+        readout_fn=_rlc_readout,
+    )
+    orig_shot = page_boom.screenshot
+
+    async def _fail_on_second(*, type: str = "png") -> bytes:  # noqa: A002
+        if page_boom.screenshot_count >= 1:
+            raise RuntimeError("simulated browser disconnect")
+        return await orig_shot(type=type)
+
+    page_boom.screenshot = _fail_on_second  # type: ignore[method-assign]
+    sess_boom = _make_session(
+        tmp_path / "sweep_fail",
+        profile=prof_fix,
+        page=page_boom,
+        ocr=_MockOcrBackend(page_boom, prof_fix),
+    )
+    with pytest.raises(RuntimeError, match="simulated browser disconnect"):
+        await sess_boom.sweep(
+            SweepSpec(
+                axes=[SweepAxis(control="omega", values=[2500, 2490])],
+                readouts=["uc_over_u"],
+                settle_ms=0,
+            )
+        )
+    assert sess_boom.workspace.read_status().phase == "failed"
+    boom_partial = json.loads(
+        (sess_boom.workspace.root / "partial-readings.json").read_text("utf-8")
+    )
+    assert boom_partial["status"] == "failed"
+    assert boom_partial["count"] == 1
+    assert sess_boom.workspace.verify_provenance().ok is True
+
+    # 5. External asyncio.Task.cancel() during sweep flushes partial evidence + provenance
+    page_cancel = _MockSimPage(
+        initial_state={"R": 5.0, "omega": 2500.0},
+        profile=prof_fix,
+        readout_fn=_rlc_readout,
+    )
+
+    async def _slow_wait(_ms: int) -> None:
+        await asyncio.sleep(0.05)
+
+    page_cancel.wait_for_timeout = _slow_wait  # type: ignore[method-assign]
+    sess_cancel = _make_session(
+        tmp_path / "task_cancel",
+        profile=prof_fix,
+        page=page_cancel,
+        ocr=_MockOcrBackend(page_cancel, prof_fix),
+    )
+    task = asyncio.create_task(
+        sess_cancel.sweep(
+            SweepSpec(
+                axes=[SweepAxis(control="omega", values=[2500, 2490, 2480, 2470, 2460])],
+                readouts=["uc_over_u"],
+                settle_ms=50,
+            )
+        )
+    )
+    await asyncio.sleep(0.08)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert sess_cancel.workspace.read_status().phase == "cancelled"
+    assert sess_cancel.workspace.verify_provenance().ok is True
 
 
 async def test_milestone2_protocol_stubs_raise_not_implemented() -> None:

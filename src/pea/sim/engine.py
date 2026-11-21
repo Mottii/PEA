@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 
 from PIL import Image, ImageDraw
 
-from pea.config import PeaConfig, is_origin_allowed
+from pea.config import PeaConfig, is_origin_allowed, normalize_origin
 from pea.ocr.base import OcrBackend, join_ocr_text
 from pea.schemas import (
     ActionStep,
@@ -336,12 +336,43 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
     os.replace(tmp_path, path)
 
 
-def _is_route_url_allowed(url: str, loopback_origin: str, config: PeaConfig) -> bool:
-    """Allow loopback/allowlisted HTTP(S) origins plus loopback-scoped ``blob:`` URLs."""
-    if url.startswith("blob:"):
-        inner = url.removeprefix("blob:")
-        return is_origin_allowed(inner, loopback_origin, config)
-    return is_origin_allowed(url, loopback_origin, config)
+def _origin_matches_allowlist(url: str, config: PeaConfig) -> bool:
+    """Return True iff *url* is an HTTP(S) URL whose canonical origin is in ``allowed_origins``."""
+    if not config.allowed_origins:
+        return False
+    text = url.strip()
+    if not text or any(ch.isspace() for ch in text) or "*" in text:
+        return False
+    parsed = urlsplit(text)
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        return False
+    if parsed.username is not None or parsed.password is not None or not parsed.hostname:
+        return False
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    host = parsed.hostname.lower()
+    host_fmt = f"[{host}]" if ":" in host else host
+    origin_str = f"{scheme}://{host_fmt}" if port is None else f"{scheme}://{host_fmt}:{port}"
+    try:
+        canonical = normalize_origin(origin_str)
+    except ValueError:
+        return False
+    return canonical in config.allowed_origins
+
+
+def _is_route_url_allowed(
+    url: str,
+    loopback_origin: str | None,
+    config: PeaConfig,
+) -> bool:
+    """Allow loopback/allowlisted HTTP(S) origins plus origin-scoped ``blob:`` URLs."""
+    target = url.removeprefix("blob:") if url.startswith("blob:") else url
+    if loopback_origin is None:
+        return _origin_matches_allowlist(target, config)
+    return is_origin_allowed(target, loopback_origin, config)
 
 
 class SimulatorSession:
@@ -357,7 +388,7 @@ class SimulatorSession:
         profile_store: ProfileStore,
         page: Any,
         target_url: str,
-        loopback_origin: str,
+        loopback_origin: str | None,
         stage_width: int,
         stage_height: int,
         header_height_px: int = 39,
@@ -586,6 +617,15 @@ class SimulatorSession:
                 assert step.text is not None
                 if step.x is not None and step.y is not None:
                     await self.page.mouse.click(step.x, step.y)
+                elif step.control is not None:
+                    profile = self._require_profile()
+                    if step.control not in profile.controls:
+                        raise KeyError(f"Control {step.control!r} not found in profile")
+                    ctrl = profile.controls[step.control]
+                    resolved = ctrl.input_xy or ctrl.click_xy
+                    if resolved is None:
+                        raise ValueError(f"Control {step.control!r} has no input_xy or click_xy")
+                    await self.page.mouse.click(resolved[0], resolved[1])
                 if step.select_all:
                     await self.page.keyboard.press(select_all_shortcut(self._platform_name))
                 await self.page.keyboard.type(step.text)
@@ -763,8 +803,18 @@ class SimulatorSession:
         prefix: str,
     ) -> MeasurementPoint:
         profile = self._require_profile()
-        if blur_before_capture and profile.blur_xy is not None:
-            await self._blur_focus(profile.blur_xy)
+        if blur_before_capture:
+            blur_target: PointPx | None = profile.blur_xy
+            if blur_target is None:
+                for ctrl_name in requested_settings:
+                    ctrl = profile.controls.get(ctrl_name)
+                    if ctrl is not None and ctrl.blur_xy is not None:
+                        blur_target = ctrl.blur_xy
+                        break
+            if blur_target is not None:
+                await self._blur_focus(blur_target)
+            elif self.header_height_px > 0:
+                await self._blur_focus()
 
         img, relpath, digest = await self.capture_frame(
             prefix,
@@ -937,9 +987,13 @@ class SimulatorSession:
                 )
 
                 # Single retry on transient control-readback mismatch (zero equation substitution).
+                # Only re-apply controls that were actually verified in observed_settings so
+                # unverified toggle/checkbox controls in fixed_controls are never double-clicked.
                 if spec.verify_controls and point.controls_matched is False:
                     for ctrl_name, req_val in requested.items():
-                        obs = point.observed_settings.get(ctrl_name)
+                        if ctrl_name not in point.observed_settings:
+                            continue
+                        obs = point.observed_settings[ctrl_name]
                         ctrl = profile.controls.get(ctrl_name)
                         if ctrl is not None and not values_match(req_val, obs, spec=ctrl):
                             await self._apply_single_control(ctrl_name, req_val)
@@ -1004,6 +1058,25 @@ class SimulatorSession:
                 phase="cancelled",
                 message=(
                     f"Sweep task cancelled after {len(points)}/{total_points} points; "
+                    "partial evidence preserved."
+                ),
+                progress_current=len(points),
+                progress_total=total_points,
+            )
+            raise
+        except Exception as exc:
+            self._persist_partial_readings(
+                kind="sweep",
+                status="failed",
+                points=points,
+                extra={"total_points": total_points, "error": str(exc)},
+                record_provenance=True,
+            )
+            self.workspace.update_status(
+                phase="failed",
+                error=str(exc),
+                message=(
+                    f"Sweep failed after {len(points)}/{total_points} points; "
                     "partial evidence preserved."
                 ),
                 progress_current=len(points),
@@ -1108,9 +1181,15 @@ class SimulatorSession:
                     prefix="search",
                 )
 
-                # If an arrow click drifted or lagged, fall back once to explicit set_stepper.
+                # If an arrow click or fixed control lagged, retry mismatched verified controls.
                 if spec.verify_controls and point.controls_matched is False:
-                    await self._apply_single_control(spec.sweep_control, x_val)
+                    for ctrl_name, req_val in requested.items():
+                        if ctrl_name not in point.observed_settings:
+                            continue
+                        obs = point.observed_settings[ctrl_name]
+                        ctrl_item = profile.controls.get(ctrl_name)
+                        if ctrl_item is not None and not values_match(req_val, obs, spec=ctrl_item):
+                            await self._apply_single_control(ctrl_name, req_val)
                     if spec.settle_ms > 0:
                         await self._sleep_ms(spec.settle_ms)
                     point = await self._capture_and_read_point(
@@ -1193,14 +1272,6 @@ class SimulatorSession:
                     if consecutive_drops >= spec.stop_after_drop:
                         break
 
-            self._persist_partial_readings(
-                kind=f"search_{spec.mode}",
-                status="complete",
-                points=trace,
-                extra={"sweep_control": spec.sweep_control, "readout": spec.readout},
-                record_provenance=True,
-            )
-
             if spec.mode == "threshold":
                 if not threshold_hits:
                     raise RuntimeError(
@@ -1257,6 +1328,13 @@ class SimulatorSession:
                     boundary_screenshots=boundary_shots,
                 )
 
+            self._persist_partial_readings(
+                kind=f"search_{spec.mode}",
+                status="complete",
+                points=trace,
+                extra={"sweep_control": spec.sweep_control, "readout": spec.readout},
+                record_provenance=True,
+            )
             self.workspace.update_status(
                 phase="complete",
                 message=(
@@ -1268,6 +1346,8 @@ class SimulatorSession:
             )
             return result
 
+        except SimCancelledError:
+            raise
         except asyncio.CancelledError:
             self._persist_partial_readings(
                 kind=f"search_{spec.mode}",
@@ -1280,6 +1360,29 @@ class SimulatorSession:
                 phase="cancelled",
                 message=(
                     f"Search task cancelled after {len(trace)} steps; "
+                    "partial evidence preserved."
+                ),
+                progress_current=len(trace),
+                progress_total=spec.max_steps,
+            )
+            raise
+        except Exception as exc:
+            self._persist_partial_readings(
+                kind=f"search_{spec.mode}",
+                status="failed",
+                points=trace,
+                extra={
+                    "sweep_control": spec.sweep_control,
+                    "readout": spec.readout,
+                    "error": str(exc),
+                },
+                record_provenance=True,
+            )
+            self.workspace.update_status(
+                phase="failed",
+                error=str(exc),
+                message=(
+                    f"Search {spec.mode} failed after {len(trace)} steps; "
                     "partial evidence preserved."
                 ),
                 progress_current=len(trace),
@@ -1376,6 +1479,7 @@ class SimulatorManager:
 
         server: SimRuntimeServer | None = None
         swf_meta: SwfMeta | None = None
+        loopback_origin: str | None = None
         stage_w = viewport_width or 900
         stage_h = viewport_height or 700
         eff_header_h = header_height_px
@@ -1409,8 +1513,8 @@ class SimulatorManager:
         else:
             assert url is not None
             eff_header_h = 0
-            loopback_origin = self.config.viewer_origin
-            if not is_origin_allowed(url, loopback_origin, self.config):
+            loopback_origin = None
+            if not _origin_matches_allowlist(url, self.config):
                 parsed = urlsplit(url)
                 raise PermissionError(
                     f"URL origin {parsed.scheme}://{parsed.netloc} is not allowlisted. "
