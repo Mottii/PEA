@@ -153,6 +153,44 @@ class TestRenderPlot:
         render_plot(valid, ws)
         with pytest.raises(FileExistsError):
             render_plot(valid, ws)
+        # Even overwrite=True must refuse to mutate provenance-recorded artifacts
+        with pytest.raises(FileExistsError):
+            render_plot(valid, ws, overwrite=True)
+
+        # Negative error bars rejected cleanly; whitespace title falls back to plot_id
+        with pytest.raises(ValueError):
+            render_plot(
+                PlotSpec(
+                    plot_id="neg-err",
+                    title="Neg Err",
+                    x_label="x",
+                    y_label="y",
+                    series=[
+                        PlotSeries(
+                            label="s",
+                            x=[1.0, 2.0],
+                            y=[3.0, 4.0],
+                            y_err=[-0.1, 0.2],
+                            kind="errorbar",
+                        )
+                    ],
+                ),
+                ws,
+            )
+
+        blank_title_fig = render_plot(
+            PlotSpec(
+                plot_id="fallback-caption",
+                title="   ",
+                x_label="x",
+                y_label="y",
+                series=[PlotSeries(label="s", x=[1.0, 2.0], y=[3.0, 4.0])],
+                annotations=["Note"],
+            ),
+            ws,
+        )
+        assert blank_title_fig.caption == "fallback-caption"
+        assert ws.verify_provenance().ok
 
 
 class TestRenderDiagram:
@@ -189,6 +227,68 @@ class TestRenderDiagram:
             ws.resolve_path(fig.svg_relpath or ""),
             ws.resolve_path(fig.png_relpath or ""),
         )
+        assert ws.verify_provenance().ok
+
+    def test_schemdraw_branched_circuit_meters_respect_to_orientation(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression test: schemdraw Source/Meter subclasses must honor .to() orientation."""
+        import schemdraw
+        import schemdraw.elements as elm
+
+        # Direct geometry verification: MeterV and SourceSin with elmparams theta cleared
+        for cls, start, end in [
+            (elm.MeterV, (5.0, 4.8), (8.0, 4.8)),
+            (elm.MeterA, (2.5, 3.0), (5.0, 3.0)),
+            (elm.MeterV, (13.2, 3.0), (13.2, 0.0)),
+            (elm.SourceSin, (0.0, 0.0), (3.0, 0.0)),
+        ]:
+            d = schemdraw.Drawing(show=False)
+            el = cls().at(start)
+            el.elmparams.pop("theta", None)
+            el.elmparams.pop("d", None)
+            el = el.to(end)
+            d.add(el)
+            d.draw(show=False)
+            assert el.absanchors["end"][0] == pytest.approx(end[0], abs=1e-6)
+            assert el.absanchors["end"][1] == pytest.approx(end[1], abs=1e-6)
+
+        mgr = WorkspaceManager(tmp_path / "runs")
+        ws = mgr.create_run(label="branched-circuit-test")
+        branched = DiagramSpec(
+            diagram_id="lab5-branched-voltmeters",
+            kind="circuit",
+            title="RLC-контур с параллельными вольтметрами",
+            elements=[
+                DiagramElement(
+                    kind="source_sin",
+                    at=(0.0, 0.0),
+                    to=(0.0, 3.0),
+                    label=r"$\varepsilon_0 \cos\omega t$",
+                ),
+                DiagramElement(kind="switch", at=(0.0, 3.0), to=(2.5, 3.0), label=r"$K$"),
+                DiagramElement(kind="ammeter", at=(2.5, 3.0), to=(5.0, 3.0), label=r"$A$"),
+                DiagramElement(kind="resistor_iec", at=(5.0, 3.0), to=(8.0, 3.0), label=r"$R$"),
+                DiagramElement(kind="line", at=(5.0, 3.0), to=(5.0, 4.8)),
+                DiagramElement(kind="voltmeter", at=(5.0, 4.8), to=(8.0, 4.8), label=r"$V_R$"),
+                DiagramElement(kind="line", at=(8.0, 4.8), to=(8.0, 3.0)),
+                DiagramElement(kind="inductor", at=(8.0, 3.0), to=(11.0, 3.0), label=r"$L$"),
+                DiagramElement(kind="capacitor", at=(11.0, 3.0), to=(11.0, 0.0), label=r"$C$"),
+                DiagramElement(kind="line", at=(11.0, 3.0), to=(13.2, 3.0)),
+                DiagramElement(kind="voltmeter", at=(13.2, 3.0), to=(13.2, 0.0), label=r"$V_C$"),
+                DiagramElement(kind="line", at=(13.2, 0.0), to=(11.0, 0.0)),
+                DiagramElement(kind="line", at=(11.0, 0.0), to=(0.0, 0.0)),
+                DiagramElement(kind="ground", at=(0.0, 0.0)),
+            ],
+        )
+        fig = render_diagram(branched, ws)
+        _assert_valid_svg_and_png(
+            ws.resolve_path(fig.svg_relpath or ""),
+            ws.resolve_path(fig.png_relpath or ""),
+        )
+        # Aspect ratio of the branched horizontal circuit must be landscape (width > height)
+        with Image.open(ws.resolve_path(fig.png_relpath or "")) as img:
+            assert img.size[0] > img.size[1]
         assert ws.verify_provenance().ok
 
     def test_phasor_diagram_and_ac_waveform(self, tmp_path: Path) -> None:
@@ -317,3 +417,57 @@ class TestRenderDiagram:
                 ),
                 ws,
             )
+
+        with pytest.raises(DiagramError):
+            render_diagram(
+                DiagramSpec(
+                    diagram_id="bad-dpi",
+                    kind="field",
+                    elements=[DiagramElement(kind="point", at=(0.0, 0.0))],
+                ),
+                ws,
+                dpi=10,
+            )
+
+        with pytest.raises(DiagramError):
+            render_diagram(
+                DiagramSpec(
+                    diagram_id="bad-wave-nan",
+                    kind="phasor",
+                    elements=[DiagramElement(kind="wave", style={"amplitude": float("nan")})],
+                ),
+                ws,
+            )
+
+        with pytest.raises(DiagramError):
+            render_diagram(
+                DiagramSpec(
+                    diagram_id="bad-wave-range",
+                    kind="phasor",
+                    elements=[DiagramElement(kind="wave", style={"t_min": 2.0, "t_max": 1.0})],
+                ),
+                ws,
+            )
+
+        with pytest.raises(DiagramError):
+            render_diagram(
+                DiagramSpec(
+                    diagram_id="degenerate-circuit-el",
+                    kind="circuit",
+                    elements=[DiagramElement(kind="resistor", at=(1.0, 1.0), to=(1.0, 1.0))],
+                ),
+                ws,
+            )
+
+        # Provenance-tracked diagram cannot be overwritten even with overwrite=True
+        ok_diag = DiagramSpec(
+            diagram_id="immutable-diag",
+            kind="field",
+            title="   ",
+            elements=[DiagramElement(kind="dipole", at=(0.0, 0.0), length=1.6)],
+        )
+        res = render_diagram(ok_diag, ws)
+        assert res.caption == "immutable-diag"
+        with pytest.raises(FileExistsError):
+            render_diagram(ok_diag, ws, overwrite=True)
+        assert ws.verify_provenance().ok

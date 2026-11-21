@@ -15,10 +15,18 @@ import math
 import os
 import re
 import secrets
+import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    fcntl = None  # type: ignore[assignment]
+
 from pea.schemas import CalcRequest, CalcResult, CalcVariable
+
+_LEDGER_LOCK = threading.Lock()
 
 if TYPE_CHECKING:
     from pea.workspace import RunWorkspace
@@ -59,6 +67,7 @@ UNIT_TABLE: dict[str, tuple[float, Dims]] = {
     "rad": (1.0, DIMLESS),
     "deg": (math.pi / 180.0, DIMLESS),
     "рад": (1.0, DIMLESS),
+    "град": (math.pi / 180.0, DIMLESS),
     # Mass (kg)
     "kg": (1.0, (1, 0, 0, 0, 0)),
     "g": (1e-3, (1, 0, 0, 0, 0)),
@@ -79,6 +88,8 @@ UNIT_TABLE: dict[str, tuple[float, Dims]] = {
     "м": (1.0, (0, 1, 0, 0, 0)),
     "см": (1e-2, (0, 1, 0, 0, 0)),
     "мм": (1e-3, (0, 1, 0, 0, 0)),
+    "мкм": (1e-6, (0, 1, 0, 0, 0)),
+    "нм": (1e-9, (0, 1, 0, 0, 0)),
     # Time (s)
     "s": (1.0, (0, 0, 1, 0, 0)),
     "ms": (1e-3, (0, 0, 1, 0, 0)),
@@ -103,11 +114,13 @@ UNIT_TABLE: dict[str, tuple[float, Dims]] = {
     "N": (1.0, (1, 1, -2, 0, 0)),
     "mN": (1e-3, (1, 1, -2, 0, 0)),
     "kN": (1e3, (1, 1, -2, 0, 0)),
+    "Н": (1.0, (1, 1, -2, 0, 0)),
     # Energy (J = kg*m^2/s^2)
     "J": (1.0, (1, 2, -2, 0, 0)),
     "mJ": (1e-3, (1, 2, -2, 0, 0)),
     "kJ": (1e3, (1, 2, -2, 0, 0)),
     "MJ": (1e6, (1, 2, -2, 0, 0)),
+    "Дж": (1.0, (1, 2, -2, 0, 0)),
     "eV": (1.602176634e-19, (1, 2, -2, 0, 0)),
     "keV": (1.602176634e-16, (1, 2, -2, 0, 0)),
     "MeV": (1.602176634e-13, (1, 2, -2, 0, 0)),
@@ -117,22 +130,29 @@ UNIT_TABLE: dict[str, tuple[float, Dims]] = {
     "uW": (1e-6, (1, 2, -3, 0, 0)),
     "kW": (1e3, (1, 2, -3, 0, 0)),
     "MW": (1e6, (1, 2, -3, 0, 0)),
+    "Вт": (1.0, (1, 2, -3, 0, 0)),
     # Pressure (Pa = kg/(m*s^2))
     "Pa": (1.0, (1, -1, -2, 0, 0)),
     "kPa": (1e3, (1, -1, -2, 0, 0)),
     "MPa": (1e6, (1, -1, -2, 0, 0)),
+    "Па": (1.0, (1, -1, -2, 0, 0)),
+    "кПа": (1e3, (1, -1, -2, 0, 0)),
+    "МПа": (1e6, (1, -1, -2, 0, 0)),
     "bar": (1e5, (1, -1, -2, 0, 0)),
     "atm": (101325.0, (1, -1, -2, 0, 0)),
     # Temperature (K)
     "K": (1.0, (0, 0, 0, 0, 1)),
+    "К": (1.0, (0, 0, 0, 0, 1)),
     # Electric Current (A)
     "A": (1.0, (0, 0, 0, 1, 0)),
     "mA": (1e-3, (0, 0, 0, 1, 0)),
     "uA": (1e-6, (0, 0, 0, 1, 0)),
     "nA": (1e-9, (0, 0, 0, 1, 0)),
+    "pA": (1e-12, (0, 0, 0, 1, 0)),
     "kA": (1e3, (0, 0, 0, 1, 0)),
     "А": (1.0, (0, 0, 0, 1, 0)),
     "мА": (1e-3, (0, 0, 0, 1, 0)),
+    "мкА": (1e-6, (0, 0, 0, 1, 0)),
     "кА": (1e3, (0, 0, 0, 1, 0)),
     # Electric Charge (C = A*s)
     "C": (1.0, (0, 0, 1, 1, 0)),
@@ -140,6 +160,7 @@ UNIT_TABLE: dict[str, tuple[float, Dims]] = {
     "uC": (1e-6, (0, 0, 1, 1, 0)),
     "nC": (1e-9, (0, 0, 1, 1, 0)),
     "pC": (1e-12, (0, 0, 1, 1, 0)),
+    "Кл": (1.0, (0, 0, 1, 1, 0)),
     # Voltage (V = kg*m^2/(s^3*A))
     "V": (1.0, (1, 2, -3, -1, 0)),
     "mV": (1e-3, (1, 2, -3, -1, 0)),
@@ -148,12 +169,16 @@ UNIT_TABLE: dict[str, tuple[float, Dims]] = {
     "MV": (1e6, (1, 2, -3, -1, 0)),
     "В": (1.0, (1, 2, -3, -1, 0)),
     "мВ": (1e-3, (1, 2, -3, -1, 0)),
+    "мкВ": (1e-6, (1, 2, -3, -1, 0)),
+    "кВ": (1e3, (1, 2, -3, -1, 0)),
     # Resistance / Impedance (Ohm = kg*m^2/(s^3*A^2))
     "Ohm": (1.0, (1, 2, -3, -2, 0)),
     "ohm": (1.0, (1, 2, -3, -2, 0)),
+    "uOhm": (1e-6, (1, 2, -3, -2, 0)),
     "mOhm": (1e-3, (1, 2, -3, -2, 0)),
     "kOhm": (1e3, (1, 2, -3, -2, 0)),
     "MOhm": (1e6, (1, 2, -3, -2, 0)),
+    "GOhm": (1e9, (1, 2, -3, -2, 0)),
     "Ом": (1.0, (1, 2, -3, -2, 0)),
     "кОм": (1e3, (1, 2, -3, -2, 0)),
     "МОм": (1e6, (1, 2, -3, -2, 0)),
@@ -167,6 +192,7 @@ UNIT_TABLE: dict[str, tuple[float, Dims]] = {
     "uF": (1e-6, (-1, -2, 4, 2, 0)),
     "nF": (1e-9, (-1, -2, 4, 2, 0)),
     "pF": (1e-12, (-1, -2, 4, 2, 0)),
+    "fF": (1e-15, (-1, -2, 4, 2, 0)),
     "Ф": (1.0, (-1, -2, 4, 2, 0)),
     "мкФ": (1e-6, (-1, -2, 4, 2, 0)),
     "нФ": (1e-9, (-1, -2, 4, 2, 0)),
@@ -191,6 +217,8 @@ UNIT_TABLE: dict[str, tuple[float, Dims]] = {
     "Wb": (1.0, (1, 2, -2, -1, 0)),
     "mWb": (1e-3, (1, 2, -2, -1, 0)),
     "uWb": (1e-6, (1, 2, -2, -1, 0)),
+    "Вб": (1.0, (1, 2, -2, -1, 0)),
+    "мВб": (1e-3, (1, 2, -2, -1, 0)),
 }
 
 _CANONICAL_SI_NAMES: dict[Dims, str] = {
@@ -342,11 +370,17 @@ def _eval_unit_node(node: ast.AST, depth: int = 0) -> tuple[float, Dims]:
         if isinstance(node.op, ast.Div):
             ls, ld = _eval_unit_node(node.left, depth + 1)
             rs, rd = _eval_unit_node(node.right, depth + 1)
+            if rs == 0.0:
+                raise UnitParseError("Division by zero in unit expression")
             return (ls / rs, dims_div(ld, rd))
         if isinstance(node.op, ast.Pow):
             ls, ld = _eval_unit_node(node.left, depth + 1)
             exp = _eval_unit_exponent(node.right)
-            return (ls**exp, dims_pow(ld, exp))
+            try:
+                scale = float(ls**exp)
+            except (OverflowError, ZeroDivisionError, ValueError) as exc:
+                raise UnitParseError(f"Invalid unit scale exponentiation: {exc}") from exc
+            return (scale, dims_pow(ld, exp))
         raise UnitParseError(f"Unsupported operator in unit expression: {type(node.op).__name__}")
     raise UnitParseError(f"Unsupported syntax in unit expression: {type(node).__name__}")
 
@@ -417,14 +451,15 @@ def _scale_grad(g: dict[str, float], factor: float) -> dict[str, float]:
 class Quantity:
     """SI-normalized dimensional quantity supporting real, complex, and 3D vector values.
 
-    ``grad_re`` and ``grad_im`` track first-order partial derivatives with respect to
-    uncertain input variables (in SI units) for exact linear Gaussian error propagation.
+    ``grad_re``, ``grad_im``, and ``grad_vec`` track first-order partial derivatives with
+    respect to uncertain input variables (in SI units) for exact linear Gaussian propagation.
     """
 
     value: float | complex | tuple[float, ...]
     dims: Dims = DIMLESS
     grad_re: dict[str, float] = field(default_factory=dict)
     grad_im: dict[str, float] = field(default_factory=dict)
+    grad_vec: tuple[dict[str, float], ...] = ()
 
     @property
     def is_vector(self) -> bool:
@@ -437,6 +472,12 @@ class Quantity:
     @property
     def is_real_scalar(self) -> bool:
         return isinstance(self.value, (int, float)) and not isinstance(self.value, bool)
+
+    def vec_grads(self) -> tuple[dict[str, float], ...]:
+        assert isinstance(self.value, tuple)
+        if self.grad_vec:
+            return self.grad_vec
+        return tuple({} for _ in self.value)
 
     def as_complex_parts(self) -> tuple[float, float, dict[str, float], dict[str, float]]:
         if isinstance(self.value, complex):
@@ -473,10 +514,27 @@ BUILTIN_CONSTANTS: dict[str, Quantity] = {
 # ---------------------------------------------------------------------------
 
 
+def _holomorphic_grads(
+    deriv: complex,
+    grad_re: dict[str, float],
+    grad_im: dict[str, float],
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Propagate complex gradients through holomorphic f(z) with derivative f'(z) = u + iv."""
+    _ensure_finite_scalar(deriv, "complex derivative")
+    if not grad_re and not grad_im:
+        return {}, {}
+    gr = _add_grads(grad_re, grad_im, deriv.real, -deriv.imag)
+    gi = _add_grads(grad_re, grad_im, deriv.imag, deriv.real)
+    return gr, gi
+
+
 def _q_neg(a: Quantity) -> Quantity:
     if a.is_vector:
         assert isinstance(a.value, tuple)
-        return Quantity(tuple(-x for x in a.value), a.dims)
+        gvec = (
+            tuple(_scale_grad(g, -1.0) for g in a.vec_grads()) if a.grad_vec else ()
+        )
+        return Quantity(tuple(-x for x in a.value), a.dims, grad_vec=gvec)
     if a.is_complex:
         assert isinstance(a.value, complex)
         return Quantity(
@@ -505,7 +563,13 @@ def _q_add_sub(a: Quantity, b: Quantity, sign: float) -> Quantity:
         res = tuple(x + sign * y for x, y in zip(a.value, b.value, strict=True))
         for item in res:
             _ensure_finite_scalar(item, "vector component")
-        return Quantity(res, a.dims)
+        gvec: tuple[dict[str, float], ...] = ()
+        if a.grad_vec or b.grad_vec:
+            gvec = tuple(
+                _add_grads(ga, gb, 1.0, sign)
+                for ga, gb in zip(a.vec_grads(), b.vec_grads(), strict=True)
+            )
+        return Quantity(res, a.dims, grad_vec=gvec)
 
     if a.is_complex or b.is_complex:
         ar, ai, gar, gai = a.as_complex_parts()
@@ -538,34 +602,44 @@ def _q_mul(a: Quantity, b: Quantity) -> Quantity:
         res = tuple(x * sf for x in vec_q.value)
         for item in res:
             _ensure_finite_scalar(item, "vector component")
-        return Quantity(res, out_dims)
+        gvec: tuple[dict[str, float], ...] = ()
+        if vec_q.grad_vec or scalar_q.grad_re:
+            gvec = tuple(
+                _add_grads(gv, scalar_q.grad_re, sf, x)
+                for x, gv in zip(vec_q.value, vec_q.vec_grads(), strict=True)
+            )
+        return Quantity(res, out_dims, grad_vec=gvec)
 
     if a.is_complex or b.is_complex:
         ar, ai, gar, gai = a.as_complex_parts()
         br, bi, gbr, gbi = b.as_complex_parts()
         val = complex(ar * br - ai * bi, ar * bi + ai * br)
         _ensure_finite_scalar(val)
-        # d(ar*br - ai*bi) = br*dar + ar*dbr - bi*dai - ai*dbi
-        gr = _add_grads(
-            _add_grads(gar, gbr, br, ar),
-            _add_grads(gai, gbi, bi, ai),
-            1.0,
-            -1.0,
-        )
-        # d(ar*bi + ai*br) = bi*dar + ar*dbi + br*dai + ai*dbr
-        gi = _add_grads(
-            _add_grads(gar, gbi, bi, ar),
-            _add_grads(gai, gbr, br, ai),
-            1.0,
-            1.0,
-        )
+        gr: dict[str, float] = {}
+        gi: dict[str, float] = {}
+        if gar or gai or gbr or gbi:
+            # d(ar*br - ai*bi) = br*dar + ar*dbr - bi*dai - ai*dbi
+            gr = _add_grads(
+                _add_grads(gar, gbr, br, ar),
+                _add_grads(gai, gbi, bi, ai),
+                1.0,
+                -1.0,
+            )
+            # d(ar*bi + ai*br) = bi*dar + ar*dbi + br*dai + ai*dbr
+            gi = _add_grads(
+                _add_grads(gar, gbi, bi, ar),
+                _add_grads(gai, gbr, br, ai),
+                1.0,
+                1.0,
+            )
         return Quantity(val, out_dims, gr, gi)
 
     assert isinstance(a.value, (int, float)) and isinstance(b.value, (int, float))
     af, bf = float(a.value), float(b.value)
     val_f = af * bf
     _ensure_finite_scalar(val_f)
-    return Quantity(val_f, out_dims, _add_grads(a.grad_re, b.grad_re, bf, af))
+    grad = _add_grads(a.grad_re, b.grad_re, bf, af) if (a.grad_re or b.grad_re) else {}
+    return Quantity(val_f, out_dims, grad)
 
 
 def _q_div(a: Quantity, b: Quantity) -> Quantity:
@@ -582,7 +656,19 @@ def _q_div(a: Quantity, b: Quantity) -> Quantity:
         res = tuple(x / bf for x in a.value)
         for item in res:
             _ensure_finite_scalar(item, "vector component")
-        return Quantity(res, out_dims)
+        gvec: tuple[dict[str, float], ...] = ()
+        if a.grad_vec or b.grad_re:
+            try:
+                inv_b = 1.0 / bf
+                gvec = tuple(
+                    _add_grads(gv, b.grad_re, inv_b, -(x / bf) / bf)
+                    for x, gv in zip(a.value, a.vec_grads(), strict=True)
+                )
+            except (ZeroDivisionError, OverflowError) as exc:
+                raise CalcError(
+                    f"Unable to propagate uncertainty through vector division: {exc}"
+                ) from exc
+        return Quantity(res, out_dims, grad_vec=gvec)
 
     if a.is_complex or b.is_complex:
         ar, ai, gar, gai = a.as_complex_parts()
@@ -597,28 +683,38 @@ def _q_div(a: Quantity, b: Quantity) -> Quantity:
         gr: dict[str, float] = {}
         gi: dict[str, float] = {}
         if gar or gai or gbr or gbi:
-            denom = br * br + bi * bi
-            if denom == 0.0 or not math.isfinite(denom):
-                raise CalcError("Unable to propagate uncertainty through ill-scaled complex ratio")
-            num_re = ar * br + ai * bi
-            num_im = ai * br - ar * bi
-            d_denom = _add_grads(gbr, gbi, 2.0 * br, 2.0 * bi)
-            d_num_re = _add_grads(_add_grads(gar, gbr, br, ar), _add_grads(gai, gbi, bi, ai))
-            d_num_im = _add_grads(
-                _add_grads(gai, gbr, br, ai), _add_grads(gar, gbi, bi, ar), 1.0, -1.0
-            )
-            inv_d2 = 1.0 / (denom * denom)
-            gr = _add_grads(d_num_re, d_denom, denom * inv_d2, -num_re * inv_d2)
-            gi = _add_grads(d_num_im, d_denom, denom * inv_d2, -num_im * inv_d2)
+            # Quotient rule: d(a/b) = (da - (a/b)*db) / b  (avoids b^2 underflow/overflow)
+            b_complex = complex(br, bi)
+            try:
+                inv_b = 1.0 / b_complex
+                neg_q_over_b = -val / b_complex
+            except (ZeroDivisionError, OverflowError) as exc:
+                raise CalcError(
+                    f"Unable to propagate uncertainty through ill-scaled complex ratio: {exc}"
+                ) from exc
+            gr_a, gi_a = _holomorphic_grads(inv_b, gar, gai)
+            gr_b, gi_b = _holomorphic_grads(neg_q_over_b, gbr, gbi)
+            gr = _add_grads(gr_a, gr_b)
+            gi = _add_grads(gi_a, gi_b)
         return Quantity(val, out_dims, gr, gi)
 
     assert isinstance(a.value, (int, float)) and isinstance(b.value, (int, float))
     af, bf = float(a.value), float(b.value)
     if bf == 0.0:
         raise CalcError("Division by zero")
-    val_f = af / bf
+    try:
+        val_f = af / bf
+    except (ZeroDivisionError, OverflowError) as exc:
+        raise CalcError(f"Invalid division: {exc}") from exc
     _ensure_finite_scalar(val_f)
-    grad = _add_grads(a.grad_re, b.grad_re, 1.0 / bf, -af / (bf * bf))
+    grad: dict[str, float] = {}
+    if a.grad_re or b.grad_re:
+        try:
+            da_coeff = 1.0 / bf if a.grad_re else 0.0
+            db_coeff = -(val_f / bf) if b.grad_re else 0.0
+        except (ZeroDivisionError, OverflowError) as exc:
+            raise CalcError(f"Unable to propagate uncertainty through division: {exc}") from exc
+        grad = _add_grads(a.grad_re, b.grad_re, da_coeff, db_coeff)
     return Quantity(val_f, out_dims, grad)
 
 
@@ -636,13 +732,34 @@ def _q_pow(a: Quantity, b: Quantity) -> Quantity:
         assert isinstance(b.value, complex)
         if abs(b.value) > _MAX_EXPONENT_ABS:
             raise CalcError(f"Exponent magnitude exceeds safe limit ({_MAX_EXPONENT_ABS:g})")
-        az = complex(a.value)  # type: ignore[arg-type]
+        ar, ai, gar, gai = a.as_complex_parts()
+        az = complex(ar, ai)
         try:
             val = az**b.value
         except (ZeroDivisionError, OverflowError, ValueError) as exc:
             raise CalcError(f"Invalid power operation: {exc}") from exc
         _ensure_finite_scalar(val)
-        return Quantity(val, DIMLESS)
+        gr: dict[str, float] = {}
+        gi: dict[str, float] = {}
+        if gar or gai:
+            if az == 0:
+                raise CalcError("Cannot propagate uncertainty through 0**(complex exponent)")
+            try:
+                dz = b.value * (az ** (b.value - 1.0))
+            except (ZeroDivisionError, OverflowError, ValueError) as exc:
+                raise CalcError(f"Invalid complex power derivative: {exc}") from exc
+            gr, gi = _holomorphic_grads(dz, gar, gai)
+        if b.grad_re or b.grad_im:
+            if az == 0:
+                raise CalcError("Cannot propagate uncertainty through exponent of zero base")
+            try:
+                dw = val * cmath.log(az)
+            except (ZeroDivisionError, OverflowError, ValueError) as exc:
+                raise CalcError(f"Invalid complex power exponent derivative: {exc}") from exc
+            gr_w, gi_w = _holomorphic_grads(dw, b.grad_re, b.grad_im)
+            gr = _add_grads(gr, gr_w)
+            gi = _add_grads(gi, gi_w)
+        return Quantity(val, DIMLESS, gr, gi)
 
     assert isinstance(b.value, (int, float))
     exp = float(b.value)
@@ -657,15 +774,33 @@ def _q_pow(a: Quantity, b: Quantity) -> Quantity:
         except (ZeroDivisionError, OverflowError, ValueError) as exc:
             raise CalcError(f"Invalid complex power operation: {exc}") from exc
         _ensure_finite_scalar(val_c)
-        # Complex gradient when exponent is constant real
-        if not b.grad_re and (a.grad_re or a.grad_im):
+        gr = {}
+        gi = {}
+        if a.grad_re or a.grad_im:
+            if exp == 0.0:
+                pass
+            elif a.value == 0:
+                if exp < 1.0:
+                    raise CalcError("Infinite derivative at zero complex base")
+                if exp == 1.0:
+                    gr, gi = dict(a.grad_re), dict(a.grad_im)
+            else:
+                try:
+                    deriv = exp * (a.value ** (exp - 1.0))
+                except (ZeroDivisionError, OverflowError, ValueError) as exc:
+                    raise CalcError(f"Invalid complex power derivative: {exc}") from exc
+                gr, gi = _holomorphic_grads(deriv, a.grad_re, a.grad_im)
+        if b.grad_re:
             if a.value == 0:
-                return Quantity(val_c, out_dims)
-            deriv = exp * (a.value ** (exp - 1.0))
-            gr = _add_grads(a.grad_re, a.grad_im, deriv.real, -deriv.imag)
-            gi = _add_grads(a.grad_re, a.grad_im, deriv.imag, deriv.real)
-            return Quantity(val_c, out_dims, gr, gi)
-        return Quantity(val_c, out_dims)
+                raise CalcError("Cannot propagate uncertainty through exponent of zero base")
+            try:
+                dw = val_c * cmath.log(a.value)
+            except (ZeroDivisionError, OverflowError, ValueError) as exc:
+                raise CalcError(f"Invalid complex power exponent derivative: {exc}") from exc
+            gr_w, gi_w = _holomorphic_grads(dw, b.grad_re, {})
+            gr = _add_grads(gr, gr_w)
+            gi = _add_grads(gi, gi_w)
+        return Quantity(val_c, out_dims, gr, gi)
 
     assert isinstance(a.value, (int, float))
     base = float(a.value)
@@ -688,12 +823,18 @@ def _q_pow(a: Quantity, b: Quantity) -> Quantity:
         elif base == 0.0:
             da = 1.0 if exp == 1.0 else (0.0 if exp > 1.0 else float("inf"))
         else:
-            da = exp * (base ** (exp - 1.0))
+            try:
+                da = float(exp * (base ** (exp - 1.0)))
+            except (ZeroDivisionError, OverflowError, ValueError) as exc:
+                raise CalcError(f"Unable to propagate uncertainty through power: {exc}") from exc
         grad = _scale_grad(a.grad_re, da)
     if b.grad_re:
         if base <= 0.0:
             raise CalcError("Cannot propagate uncertainty through exponent of non-positive base")
-        db = val_f * math.log(base)
+        try:
+            db = float(val_f * math.log(base))
+        except (OverflowError, ValueError) as exc:
+            raise CalcError(f"Unable to propagate uncertainty through exponent: {exc}") from exc
         grad = _add_grads(grad, b.grad_re, 1.0, db)
     return Quantity(val_f, out_dims, grad)
 
@@ -710,13 +851,17 @@ def _fn_sqrt(args: list[Quantity]) -> Quantity:
         raise CalcError("sqrt() is not defined for vectors")
     out_dims = dims_pow(q.dims, 0.5)
     if q.is_complex:
-        if q.dims != DIMLESS:
-            # Dimensions were already validated as even, so complex sqrt of dimensional value works
-            pass
         assert isinstance(q.value, complex)
         val_c = cmath.sqrt(q.value)
         _ensure_finite_scalar(val_c)
-        return Quantity(val_c, out_dims)
+        gr: dict[str, float] = {}
+        gi: dict[str, float] = {}
+        if q.grad_re or q.grad_im:
+            if val_c == 0:
+                raise CalcError("Infinite derivative in complex sqrt(0) uncertainty propagation")
+            deriv = 0.5 / val_c
+            gr, gi = _holomorphic_grads(deriv, q.grad_re, q.grad_im)
+        return Quantity(val_c, out_dims, gr, gi)
     assert isinstance(q.value, (int, float))
     v = float(q.value)
     if v < 0.0:
@@ -786,8 +931,15 @@ def _fn_arg(args: list[Quantity]) -> Quantity:
     if ar == 0.0 and ai == 0.0:
         raise CalcError("arg(0) is undefined")
     angle = math.atan2(ai, ar)
-    r2 = ar * ar + ai * ai
-    grad = _add_grads(gai, gar, ar / r2, -ai / r2)
+    grad: dict[str, float] = {}
+    if gar or gai:
+        h = math.hypot(ar, ai)
+        if h == 0.0 or not math.isfinite(h):
+            raise CalcError("Unable to propagate uncertainty through arg() at ill-scaled point")
+        try:
+            grad = _add_grads(gai, gar, (ar / h) / h, -(ai / h) / h)
+        except (ZeroDivisionError, OverflowError) as exc:
+            raise CalcError(f"Unable to propagate uncertainty through arg(): {exc}") from exc
     return Quantity(angle, DIMLESS, grad)
 
 
@@ -796,6 +948,8 @@ def _fn_vec(args: list[Quantity]) -> Quantity:
         raise CalcError(f"vec() expects 3 scalar components; got {len(args)}")
     dims = args[0].dims
     comps: list[float] = []
+    grads: list[dict[str, float]] = []
+    has_grad = False
     for item in args:
         if not item.is_real_scalar:
             raise CalcError("vec() requires real scalar components")
@@ -805,7 +959,14 @@ def _fn_vec(args: list[Quantity]) -> Quantity:
                 f"{format_si_dims(dims)} vs {format_si_dims(item.dims)}"
             )
         comps.append(float(item.value))  # type: ignore[arg-type]
-    return Quantity((comps[0], comps[1], comps[2]), dims)
+        if item.grad_re:
+            has_grad = True
+        grads.append(dict(item.grad_re))
+    return Quantity(
+        (comps[0], comps[1], comps[2]),
+        dims,
+        grad_vec=tuple(grads) if has_grad else (),
+    )
 
 
 def _fn_dot(args: list[Quantity]) -> Quantity:
@@ -818,7 +979,12 @@ def _fn_dot(args: list[Quantity]) -> Quantity:
         raise CalcError(f"dot() vector length mismatch: {len(a.value)} vs {len(b.value)}")
     val = sum(x * y for x, y in zip(a.value, b.value, strict=True))
     _ensure_finite_scalar(val)
-    return Quantity(float(val), dims_mul(a.dims, b.dims))
+    grad: dict[str, float] = {}
+    if a.grad_vec or b.grad_vec:
+        for x, y, ga, gb in zip(a.value, b.value, a.vec_grads(), b.vec_grads(), strict=True):
+            term_g = _add_grads(ga, gb, y, x)
+            grad = _add_grads(grad, term_g)
+    return Quantity(float(val), dims_mul(a.dims, b.dims), grad)
 
 
 def _fn_cross(args: list[Quantity]) -> Quantity:
@@ -836,7 +1002,15 @@ def _fn_cross(args: list[Quantity]) -> Quantity:
     res = (ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx)
     for item in res:
         _ensure_finite_scalar(item, "cross product component")
-    return Quantity(res, dims_mul(a.dims, b.dims))
+    gvec: tuple[dict[str, float], ...] = ()
+    if a.grad_vec or b.grad_vec:
+        gax, gay, gaz = a.vec_grads()
+        gbx, gby, gbz = b.vec_grads()
+        gx = _add_grads(_add_grads(gay, gbz, bz, ay), _add_grads(gaz, gby, by, az), 1.0, -1.0)
+        gy = _add_grads(_add_grads(gaz, gbx, bx, az), _add_grads(gax, gbz, bz, ax), 1.0, -1.0)
+        gz = _add_grads(_add_grads(gax, gby, by, ax), _add_grads(gay, gbx, bx, ay), 1.0, -1.0)
+        gvec = (gx, gy, gz)
+    return Quantity(res, dims_mul(a.dims, b.dims), grad_vec=gvec)
 
 
 def _fn_norm(args: list[Quantity]) -> Quantity:
@@ -845,9 +1019,16 @@ def _fn_norm(args: list[Quantity]) -> Quantity:
     if not q.is_vector:
         return _fn_abs(args)
     assert isinstance(q.value, tuple)
-    val = math.sqrt(sum(x * x for x in q.value))
+    val = math.hypot(*q.value)
     _ensure_finite_scalar(val)
-    return Quantity(val, q.dims)
+    grad: dict[str, float] = {}
+    if q.grad_vec:
+        if val == 0.0:
+            raise CalcError("Undefined derivative in norm(0) uncertainty propagation")
+        for comp, gc in zip(q.value, q.vec_grads(), strict=True):
+            if gc:
+                grad = _add_grads(grad, gc, 1.0, comp / val)
+    return Quantity(val, q.dims, grad)
 
 
 def _fn_dimless_unary(
@@ -856,6 +1037,7 @@ def _fn_dimless_unary(
     real_fn: Any,
     deriv_fn: Any,
     complex_fn: Any | None = None,
+    complex_deriv_fn: Any | None = None,
 ) -> Quantity:
     _require_arity(name, args, 1)
     q = args[0]
@@ -874,7 +1056,19 @@ def _fn_dimless_unary(
         except (ValueError, OverflowError, ZeroDivisionError) as exc:
             raise CalcError(f"{name}() domain error: {exc}") from exc
         _ensure_finite_scalar(val_c)
-        return Quantity(val_c, DIMLESS)
+        gr: dict[str, float] = {}
+        gi: dict[str, float] = {}
+        if q.grad_re or q.grad_im:
+            if complex_deriv_fn is None:
+                raise CalcError(
+                    f"{name}() uncertainty propagation is not supported for complex arguments"
+                )
+            try:
+                dc = complex(complex_deriv_fn(q.value))
+            except (ValueError, OverflowError, ZeroDivisionError) as exc:
+                raise CalcError(f"{name}() complex derivative error: {exc}") from exc
+            gr, gi = _holomorphic_grads(dc, q.grad_re, q.grad_im)
+        return Quantity(val_c, DIMLESS, gr, gi)
     assert isinstance(q.value, (int, float))
     v = float(q.value)
     try:
@@ -906,8 +1100,15 @@ def _fn_atan2(args: list[Quantity]) -> Quantity:
     if yv == 0.0 and xv == 0.0:
         raise CalcError("atan2(0, 0) is undefined")
     res = math.atan2(yv, xv)
-    r2 = xv * xv + yv * yv
-    grad = _add_grads(y.grad_re, x.grad_re, xv / r2, -yv / r2)
+    grad: dict[str, float] = {}
+    if y.grad_re or x.grad_re:
+        h = math.hypot(xv, yv)
+        if h == 0.0 or not math.isfinite(h):
+            raise CalcError("Unable to propagate uncertainty through atan2() at ill-scaled point")
+        try:
+            grad = _add_grads(y.grad_re, x.grad_re, (xv / h) / h, -(yv / h) / h)
+        except (ZeroDivisionError, OverflowError) as exc:
+            raise CalcError(f"Unable to propagate uncertainty through atan2(): {exc}") from exc
     return Quantity(res, DIMLESS, grad)
 
 
@@ -923,10 +1124,17 @@ _FUNCTIONS: dict[str, Any] = {
     "cross": _fn_cross,
     "norm": _fn_norm,
     "atan2": _fn_atan2,
-    "sin": lambda a: _fn_dimless_unary("sin", a, math.sin, math.cos, cmath.sin),
-    "cos": lambda a: _fn_dimless_unary("cos", a, math.cos, lambda x: -math.sin(x), cmath.cos),
+    "sin": lambda a: _fn_dimless_unary("sin", a, math.sin, math.cos, cmath.sin, cmath.cos),
+    "cos": lambda a: _fn_dimless_unary(
+        "cos", a, math.cos, lambda x: -math.sin(x), cmath.cos, lambda z: -cmath.sin(z)
+    ),
     "tan": lambda a: _fn_dimless_unary(
-        "tan", a, math.tan, lambda x: 1.0 / (math.cos(x) ** 2), cmath.tan
+        "tan",
+        a,
+        math.tan,
+        lambda x: 1.0 / (math.cos(x) ** 2),
+        cmath.tan,
+        lambda z: 1.0 / (cmath.cos(z) ** 2),
     ),
     "asin": lambda a: _fn_dimless_unary(
         "asin", a, math.asin, lambda x: 1.0 / math.sqrt(1.0 - x * x)
@@ -935,10 +1143,17 @@ _FUNCTIONS: dict[str, Any] = {
         "acos", a, math.acos, lambda x: -1.0 / math.sqrt(1.0 - x * x)
     ),
     "atan": lambda a: _fn_dimless_unary("atan", a, math.atan, lambda x: 1.0 / (1.0 + x * x)),
-    "exp": lambda a: _fn_dimless_unary("exp", a, math.exp, math.exp, cmath.exp),
-    "log": lambda a: _fn_dimless_unary("log", a, math.log, lambda x: 1.0 / x, cmath.log),
+    "exp": lambda a: _fn_dimless_unary("exp", a, math.exp, math.exp, cmath.exp, cmath.exp),
+    "log": lambda a: _fn_dimless_unary(
+        "log", a, math.log, lambda x: 1.0 / x, cmath.log, lambda z: 1.0 / z
+    ),
     "log10": lambda a: _fn_dimless_unary(
-        "log10", a, math.log10, lambda x: 1.0 / (x * math.log(10.0)), cmath.log10
+        "log10",
+        a,
+        math.log10,
+        lambda x: 1.0 / (x * math.log(10.0)),
+        cmath.log10,
+        lambda z: 1.0 / (z * math.log(10.0)),
     ),
 }
 
@@ -983,6 +1198,8 @@ def _eval_ast_node(node: ast.AST, env: dict[str, Quantity], depth: int = 0) -> Q
         items = [_eval_ast_node(elt, env, depth + 1) for elt in node.elts]
         dims = items[0].dims
         comps: list[float] = []
+        grads: list[dict[str, float]] = []
+        has_grad = False
         for item in items:
             if not item.is_real_scalar:
                 raise CalcError("Vector literals must contain real scalar entries")
@@ -992,7 +1209,10 @@ def _eval_ast_node(node: ast.AST, env: dict[str, Quantity], depth: int = 0) -> Q
                     f"{format_si_dims(dims)} vs {format_si_dims(item.dims)}"
                 )
             comps.append(float(item.value))  # type: ignore[arg-type]
-        return Quantity(tuple(comps), dims)
+            if item.grad_re:
+                has_grad = True
+            grads.append(dict(item.grad_re))
+        return Quantity(tuple(comps), dims, grad_vec=tuple(grads) if has_grad else ())
 
     if isinstance(node, ast.UnaryOp):
         operand = _eval_ast_node(node.operand, env, depth + 1)
@@ -1109,13 +1329,16 @@ class PhysicsCalculator:
 
         # Output unit conversion & dimensional verification
         if req.output_unit is not None:
-            out_scale, out_dims = parse_unit(req.output_unit)
+            cleaned_unit = req.output_unit.strip()
+            if not cleaned_unit:
+                raise UnitParseError("output_unit must not be empty or whitespace-only")
+            out_scale, out_dims = parse_unit(cleaned_unit)
             if out_dims != result_qty.dims:
                 raise DimensionError(
                     f"Output unit {req.output_unit!r} has dims {format_si_dims(out_dims)}, "
                     f"incompatible with result dims {format_si_dims(result_qty.dims)}"
                 )
-            output_unit_str = req.output_unit.strip()
+            output_unit_str = cleaned_unit
         else:
             out_scale = 1.0
             output_unit_str = format_si_dims(result_qty.dims)
@@ -1178,10 +1401,18 @@ class PhysicsCalculator:
 def _append_calculation_ledger(workspace: RunWorkspace, result: CalcResult) -> None:
     workspace.root.mkdir(parents=True, exist_ok=True)
     ledger_path = workspace.resolve_path("calculations.jsonl")
-    with ledger_path.open("a", encoding="utf-8") as handle:
-        handle.write(result.model_dump_json() + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    line = result.model_dump_json() + "\n"
+    with _LEDGER_LOCK:
+        with ledger_path.open("a", encoding="utf-8") as handle:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                handle.write(line)
+                handle.flush()
+                os.fsync(handle.fileno())
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def load_calculations(workspace: RunWorkspace) -> dict[str, CalcResult]:

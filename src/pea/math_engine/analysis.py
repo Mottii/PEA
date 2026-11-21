@@ -70,6 +70,18 @@ def _coerce_csv_cell(raw: str | None) -> Any:
     return num
 
 
+def _reject_non_finite_values(obj: Any, context: str) -> None:
+    if isinstance(obj, float):
+        if not math.isfinite(obj):
+            raise AnalysisError(f"Non-finite float value ({obj!r}) in {context}")
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            _reject_non_finite_values(v, f"{context}.{k}")
+    elif isinstance(obj, list):
+        for idx, item in enumerate(obj):
+            _reject_non_finite_values(item, f"{context}[{idx}]")
+
+
 def _load_file_to_dataset_spec(
     file_path: Path,
     *,
@@ -93,12 +105,29 @@ def _load_file_to_dataset_spec(
             reader = csv.DictReader(handle)
             if not reader.fieldnames:
                 raise AnalysisError(f"CSV file has no header row: {file_path}")
+            seen_headers: set[str] = set()
+            header_map: list[tuple[str, str]] = []
+            for raw_hdr in reader.fieldnames:
+                cleaned_hdr = (raw_hdr or "").strip()
+                if not cleaned_hdr:
+                    raise AnalysisError(f"CSV file contains empty column header in {file_path}")
+                if cleaned_hdr in seen_headers:
+                    raise AnalysisError(
+                        f"CSV file contains duplicate column header {cleaned_hdr!r} in {file_path}"
+                    )
+                seen_headers.add(cleaned_hdr)
+                header_map.append((raw_hdr, cleaned_hdr))
             for raw_row in reader:
                 if None in raw_row:
                     raise AnalysisError(f"CSV row has more columns than header in {file_path}")
                 if all(v is None or str(v).strip() == "" for v in raw_row.values()):
                     continue
-                rows.append({k.strip(): _coerce_csv_cell(v) for k, v in raw_row.items() if k})
+                rows.append(
+                    {
+                        cleaned_hdr: _coerce_csv_cell(raw_row.get(raw_hdr))
+                        for raw_hdr, cleaned_hdr in header_map
+                    }
+                )
         if not rows:
             raise AnalysisError(f"CSV file contains no data rows: {file_path}")
         return DatasetSpec(
@@ -113,10 +142,13 @@ def _load_file_to_dataset_spec(
         def _reject_non_finite_json(token: str) -> Any:
             raise AnalysisError(f"Non-standard JSON constant {token!r} in {file_path}")
 
-        payload = json.loads(
-            file_path.read_text(encoding="utf-8"),
-            parse_constant=_reject_non_finite_json,
-        )
+        try:
+            payload = json.loads(
+                file_path.read_text(encoding="utf-8"),
+                parse_constant=_reject_non_finite_json,
+            )
+        except json.JSONDecodeError as exc:
+            raise AnalysisError(f"Invalid JSON in dataset file {file_path}: {exc.msg}") from exc
         if isinstance(payload, dict) and "rows" in payload:
             merged = dict(payload)
             if source is not None:
@@ -176,8 +208,8 @@ def data_ingest(
     if isinstance(spec_or_path, DatasetSpec):
         ds = spec_or_path.model_copy(
             update={
-                "dataset_id": dataset_id or spec_or_path.dataset_id,
-                "source": source or spec_or_path.source,
+                "dataset_id": dataset_id if dataset_id is not None else spec_or_path.dataset_id,
+                "source": source if source is not None else spec_or_path.source,
                 "units": {**spec_or_path.units, **(units or {})},
                 "notes": notes or spec_or_path.notes,
             }
@@ -206,7 +238,9 @@ def data_ingest(
             f"Unsupported input type for data_ingest: {type(spec_or_path).__name__}"
         )
 
-    resolved_id = _validate_dataset_id(ds.dataset_id or f"ds-{secrets.token_hex(4)}")
+    _reject_non_finite_values(ds.rows, "dataset rows")
+    raw_id = ds.dataset_id if ds.dataset_id is not None else f"ds-{secrets.token_hex(4)}"
+    resolved_id = _validate_dataset_id(raw_id)
     final_ds = ds.model_copy(update={"dataset_id": resolved_id})
 
     datasets_dir = run_workspace.resolve_path("datasets")
@@ -384,6 +418,58 @@ def _eval_row_node(node: ast.AST, row: dict[str, Any], depth: int = 0) -> float:
     raise UnsafeExpressionError(f"Disallowed AST construct in formula: {type(node).__name__}")
 
 
+def _validate_row_ast(node: ast.AST, depth: int = 0) -> None:
+    """Validate AST node whitelist and depth statically before evaluating over rows."""
+    if depth > _MAX_AST_DEPTH:
+        raise UnsafeExpressionError(f"Formula exceeds maximum AST depth ({_MAX_AST_DEPTH})")
+    if isinstance(node, ast.Expression):
+        _validate_row_ast(node.body, depth + 1)
+        return
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
+            raise UnsafeExpressionError(f"Unsupported literal in formula: {node.value!r}")
+        _to_finite_float(node.value, "formula literal")
+        return
+    if isinstance(node, ast.Name):
+        ident = node.id
+        if ident.startswith("__") or ident.endswith("__"):
+            raise UnsafeExpressionError(f"Forbidden dunder identifier in formula: {ident!r}")
+        return
+    if isinstance(node, ast.UnaryOp):
+        if not isinstance(node.op, (ast.UAdd, ast.USub)):
+            raise UnsafeExpressionError(f"Unsupported unary operator: {type(node.op).__name__}")
+        _validate_row_ast(node.operand, depth + 1)
+        return
+    if isinstance(node, ast.BinOp):
+        if not isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow)):
+            raise UnsafeExpressionError(
+                f"Unsupported binary operator in formula: {type(node.op).__name__}"
+            )
+        _validate_row_ast(node.left, depth + 1)
+        _validate_row_ast(node.right, depth + 1)
+        return
+    if isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name):
+            raise UnsafeExpressionError(
+                "Only direct calls to whitelisted math functions are allowed"
+            )
+        if node.keywords:
+            raise UnsafeExpressionError("Keyword arguments are forbidden in column formulas")
+        fn_name = node.func.id
+        if fn_name in _ROW_FUNCTIONS:
+            if len(node.args) != 1:
+                raise AnalysisError(f"{fn_name}() expects 1 argument; got {len(node.args)}")
+        elif fn_name in _ROW_BINARY_FUNCTIONS:
+            if len(node.args) != 2:
+                raise AnalysisError(f"{fn_name}() expects 2 arguments; got {len(node.args)}")
+        else:
+            raise UnsafeExpressionError(f"Forbidden or unknown function in formula: {fn_name!r}")
+        for arg in node.args:
+            _validate_row_ast(arg, depth + 1)
+        return
+    raise UnsafeExpressionError(f"Disallowed AST construct in formula: {type(node).__name__}")
+
+
 def compute_derived_rows(
     rows: Sequence[dict[str, Any]],
     derived_columns: Sequence[DerivedColumnSpec],
@@ -391,26 +477,30 @@ def compute_derived_rows(
     """Evaluate derived column formulas sequentially over *rows*, returning new row dicts."""
     working_rows = [dict(r) for r in rows]
     for spec in derived_columns:
+        col_name = spec.name.strip()
+        if not col_name:
+            raise AnalysisError("Derived column name must not be empty or whitespace-only")
         formula = spec.formula.strip()
         if not formula:
-            raise AnalysisError(f"Derived column {spec.name!r} has an empty formula")
+            raise AnalysisError(f"Derived column {col_name!r} has an empty formula")
         if len(formula) > _MAX_FORMULA_LEN:
             raise UnsafeExpressionError(
-                f"Formula for {spec.name!r} exceeds maximum length ({_MAX_FORMULA_LEN} chars)"
+                f"Formula for {col_name!r} exceeds maximum length ({_MAX_FORMULA_LEN} chars)"
             )
         try:
             tree = ast.parse(formula, mode="eval")
         except SyntaxError as exc:
             raise AnalysisError(
-                f"Syntax error in derived column {spec.name!r} formula {formula!r}: {exc.msg}"
+                f"Syntax error in derived column {col_name!r} formula {formula!r}: {exc.msg}"
             ) from exc
+        _validate_row_ast(tree)
 
         for row_idx, row in enumerate(working_rows):
             try:
-                row[spec.name] = _eval_row_node(tree, row)
+                row[col_name] = _eval_row_node(tree, row)
             except (AnalysisError, UnsafeExpressionError) as exc:
                 raise type(exc)(
-                    f"Derived column {spec.name!r} failed at row {row_idx}: {exc}"
+                    f"Derived column {col_name!r} failed at row {row_idx}: {exc}"
                 ) from exc
     return working_rows
 
@@ -444,71 +534,106 @@ def run_ols_regression(
     if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
         raise AnalysisError(f"Regression {name!r} contains non-finite x or y values")
 
-    y_mean = float(np.mean(y))
-    ss_tot = float(np.sum((y - y_mean) ** 2))
+    # Rescale coordinates internally to prevent intermediate square overflow/underflow
+    sx = float(np.max(np.abs(x)))
+    sy = float(np.max(np.abs(y)))
+    if sx == 0.0:
+        if intercept == "free":
+            raise AnalysisError(
+                f"Regression {name!r} (group={group!r}) failed: x column has zero variance"
+            )
+        raise AnalysisError(
+            f"Zero-intercept regression {name!r} (group={group!r}) failed: sum(x^2) == 0"
+        )
+    xs = x / sx
+    ys = (y / sy) if sy > 0.0 else np.zeros_like(y)
+    scale_ratio = sy / sx
+
+    ys_mean = float(np.mean(ys))
+    ss_tot = float(np.sum((ys - ys_mean) ** 2))
 
     if intercept == "free":
-        x_mean = float(np.mean(x))
-        dx = x - x_mean
+        xs_mean = float(np.mean(xs))
+        dx = xs - xs_mean
         sxx = float(np.sum(dx * dx))
         if sxx == 0.0:
             raise AnalysisError(
                 f"Regression {name!r} (group={group!r}) failed: x column has zero variance"
             )
-        sxy = float(np.sum(dx * (y - y_mean)))
-        slope = sxy / sxx
-        b = y_mean - slope * x_mean
-        residuals = y - (slope * x + b)
+        sxy = float(np.sum(dx * (ys - ys_mean)))
+        slope_s = sxy / sxx
+        b_s = ys_mean - slope_s * xs_mean
+        residuals = ys - (slope_s * xs + b_s)
         ss_res = float(np.sum(residuals * residuals))
 
         if n > 2:
             s2 = max(0.0, ss_res / (n - 2))
-            slope_se = math.sqrt(s2 / sxx)
-            intercept_se: float | None = math.sqrt(s2 * (1.0 / n + (x_mean * x_mean) / sxx))
+            slope_se_s = math.sqrt(s2 / sxx)
+            intercept_se_s: float | None = math.sqrt(s2 * (1.0 / n + (xs_mean * xs_mean) / sxx))
         else:
-            slope_se = 0.0
-            intercept_se = 0.0
+            slope_se_s = 0.0
+            intercept_se_s = 0.0
 
         if ss_tot == 0.0:
             r_squared = 1.0 if ss_res <= 1e-30 else 0.0
         else:
             r_squared = min(1.0, max(0.0, 1.0 - ss_res / ss_tot))
 
+        slope = float(slope_s * scale_ratio)
+        slope_se = float(slope_se_s * scale_ratio)
+        b = float(b_s * sy)
+        intercept_se = float(intercept_se_s * sy) if intercept_se_s is not None else None
+        if not (
+            math.isfinite(slope)
+            and math.isfinite(slope_se)
+            and math.isfinite(b)
+            and (intercept_se is None or math.isfinite(intercept_se))
+            and math.isfinite(r_squared)
+        ):
+            raise AnalysisError(f"Regression {name!r} produced non-finite statistics")
+
         return RegressionOutput(
             name=name,
             group=group,
             intercept_mode="free",
-            slope=float(slope),
-            slope_se=float(slope_se),
-            intercept=float(b),
-            intercept_se=float(intercept_se) if intercept_se is not None else None,
+            slope=slope,
+            slope_se=slope_se,
+            intercept=b,
+            intercept_se=intercept_se,
             r_squared=float(r_squared),
             n_points=n,
         )
 
     if intercept == "zero":
-        sum_x2 = float(np.sum(x * x))
+        sum_x2 = float(np.sum(xs * xs))
         if sum_x2 == 0.0:
             raise AnalysisError(
                 f"Zero-intercept regression {name!r} (group={group!r}) failed: sum(x^2) == 0"
             )
-        slope = float(np.sum(x * y)) / sum_x2
-        residuals = y - slope * x
+        slope_s = float(np.sum(xs * ys)) / sum_x2
+        residuals = ys - slope_s * xs
         ss_res = float(np.sum(residuals * residuals))
         s2 = max(0.0, ss_res / (n - 1))
-        slope_se = math.sqrt(s2 / sum_x2)
+        slope_se_s = math.sqrt(s2 / sum_x2)
 
         if ss_tot == 0.0:
             r_squared = 1.0 if ss_res <= 1e-30 else 0.0
         else:
             r_squared = min(1.0, 1.0 - ss_res / ss_tot)
 
+        slope = float(slope_s * scale_ratio)
+        slope_se = float(slope_se_s * scale_ratio)
+        if not (math.isfinite(slope) and math.isfinite(slope_se) and math.isfinite(r_squared)):
+            raise AnalysisError(
+                f"Zero-intercept regression {name!r} produced non-finite statistics"
+            )
+
         return RegressionOutput(
             name=name,
             group=group,
             intercept_mode="zero",
-            slope=float(slope),
-            slope_se=float(slope_se),
+            slope=slope,
+            slope_se=slope_se,
             intercept=0.0,
             intercept_se=None,
             r_squared=float(r_squared),
@@ -616,23 +741,16 @@ def data_analyze(
         for spec in (comparisons or ())
     ]
 
+    if persist_derived_id is not None:
+        validated_persist_id = _validate_dataset_id(persist_derived_id)
+        if run_workspace.resolve_path(f"datasets/{validated_persist_id}.json").exists():
+            raise FileExistsError(
+                f"Dataset {validated_persist_id!r} already exists in run {run_workspace.run_id}; "
+                "use a unique persist_derived_id to preserve provenance immutability"
+            )
+
     working_rows = compute_derived_rows(dataset.rows, derived_specs)
     columns = _collect_columns(working_rows)
-
-    if persist_derived_id is not None:
-        merged_units = dict(dataset.units)
-        for dspec in derived_specs:
-            merged_units[dspec.name] = dspec.unit
-        data_ingest(
-            DatasetSpec(
-                dataset_id=persist_derived_id,
-                source=dataset.source,
-                rows=working_rows,
-                units=merged_units,
-                notes=dataset.notes,
-            ),
-            run_workspace,
-        )
 
     reg_outputs: list[RegressionOutput] = []
     for reg in regression_specs:
@@ -649,7 +767,13 @@ def data_analyze(
                         f"Regression {reg.name!r}: missing group_by column "
                         f"{reg.group_by!r} at row {idx}"
                     )
-                gkey = str(row[reg.group_by])
+                raw_gval = row[reg.group_by]
+                if raw_gval is None or (isinstance(raw_gval, str) and not raw_gval.strip()):
+                    raise AnalysisError(
+                        f"Regression {reg.name!r}: empty/missing group_by value in "
+                        f"{reg.group_by!r} at row {idx}"
+                    )
+                gkey = str(raw_gval)
                 groups.setdefault(gkey, []).append(row)
             for gkey, grows in groups.items():
                 xs, ys = _extract_xy(grows, reg.x_column, reg.y_column, reg.name)
@@ -660,12 +784,27 @@ def data_analyze(
     comp_outputs = [compute_comparison(comp) for comp in comparison_specs]
     summary_stats = _compute_summary_stats(working_rows, columns)
 
+    if persist_derived_id is not None:
+        merged_units = dict(dataset.units)
+        for dspec in derived_specs:
+            merged_units[dspec.name.strip()] = dspec.unit
+        data_ingest(
+            DatasetSpec(
+                dataset_id=persist_derived_id,
+                source=dataset.source,
+                rows=working_rows,
+                units=merged_units,
+                notes=dataset.notes,
+            ),
+            run_workspace,
+        )
+
     return AnalysisResult(
         dataset_id=dataset.dataset_id or dataset_id,
         source=dataset.source,
         row_count=len(working_rows),
         columns=columns,
-        derived_columns=[spec.name for spec in derived_specs],
+        derived_columns=[spec.name.strip() for spec in derived_specs],
         regressions=reg_outputs,
         comparisons=comp_outputs,
         summary_stats=summary_stats,

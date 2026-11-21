@@ -319,7 +319,113 @@ class TestRegressionAndFormulaEdgeCases:
             compute_derived_rows(rows, [DerivedColumnSpec(name="bad", formula="__import__('os')")])
         with pytest.raises(UnsafeExpressionError):
             compute_derived_rows(rows, [DerivedColumnSpec(name="bad", formula="x.__class__")])
+        # Security validation must also execute even when rows is empty
+        with pytest.raises(UnsafeExpressionError):
+            compute_derived_rows([], [DerivedColumnSpec(name="bad", formula="__import__('os')")])
+        with pytest.raises(AnalysisError):
+            compute_derived_rows(rows, [DerivedColumnSpec(name="   ", formula="x + 1")])
         with pytest.raises(AnalysisError):
             compute_derived_rows(rows, [DerivedColumnSpec(name="bad", formula="x / y")])
         with pytest.raises(AnalysisError):
             compute_derived_rows(rows, [DerivedColumnSpec(name="bad", formula="x ** 5000")])
+
+    def test_ingest_and_analyze_hardening_edge_cases(self, tmp_path: Path) -> None:
+        mgr = WorkspaceManager(tmp_path / "runs")
+        ws = mgr.create_run(label="analysis-hardening")
+
+        # Empty dataset_id and inline NaN must be rejected
+        with pytest.raises(PathConfinementError):
+            data_ingest(
+                DatasetSpec(dataset_id="", source="bench_manual", rows=[{"x": 1.0}]),
+                ws,
+            )
+        with pytest.raises(AnalysisError):
+            data_ingest(
+                DatasetSpec(
+                    dataset_id="nan-ds",
+                    source="bench_manual",
+                    rows=[{"x": float("nan"), "y": 1.0}],
+                ),
+                ws,
+            )
+
+        # Duplicate and blank CSV headers and malformed JSON must be rejected
+        bad_hdr_csv = tmp_path / "bad_hdr.csv"
+        bad_hdr_csv.write_text("x, ,x\n1,2,3\n", encoding="utf-8")
+        with pytest.raises(AnalysisError):
+            data_ingest(bad_hdr_csv, ws, source="bench_manual", dataset_id="bad-hdr")
+
+        dup_hdr_csv = tmp_path / "dup_hdr.csv"
+        dup_hdr_csv.write_text("x, x \n1,2\n", encoding="utf-8")
+        with pytest.raises(AnalysisError):
+            data_ingest(dup_hdr_csv, ws, source="bench_manual", dataset_id="dup-hdr")
+
+        bad_json = tmp_path / "broken.json"
+        bad_json.write_text("{not valid json", encoding="utf-8")
+        with pytest.raises(AnalysisError):
+            data_ingest(bad_json, ws, source="bench_manual", dataset_id="broken-json")
+
+        # Missing/blank group_by value must raise AnalysisError instead of creating 'None' group
+        missing_grp_csv = tmp_path / "missing_grp.csv"
+        missing_grp_csv.write_text("g,x,y\nA,1,2\nA,2,4\n,3,6\n,4,8\n", encoding="utf-8")
+        data_ingest(missing_grp_csv, ws, source="bench_manual", dataset_id="missing-grp")
+        with pytest.raises(AnalysisError):
+            data_analyze(
+                "missing-grp",
+                ws,
+                regressions=[
+                    RegressionSpec(name="grp", x_column="x", y_column="y", group_by="g")
+                ],
+            )
+
+        # Failed data_analyze must NOT leave an orphaned persist_derived_id file behind
+        data_ingest(
+            DatasetSpec(
+                dataset_id="clean-base",
+                source="bench_manual",
+                rows=[{"x": 1.0, "y": 2.0}, {"x": 2.0, "y": 4.0}, {"x": 3.0, "y": 6.0}],
+            ),
+            ws,
+        )
+        with pytest.raises(AnalysisError):
+            data_analyze(
+                "clean-base",
+                ws,
+                derived_columns=[DerivedColumnSpec(name="z", formula="x * 2")],
+                regressions=[RegressionSpec(name="bad", x_column="missing_col", y_column="y")],
+                persist_derived_id="derived-clean",
+            )
+        assert not ws.resolve_path("datasets/derived-clean.json").exists()
+        # Retry with valid regression and same persist_derived_id now succeeds cleanly
+        ok_res = data_analyze(
+            "clean-base",
+            ws,
+            derived_columns=[DerivedColumnSpec(name="z", formula="x * 2")],
+            regressions=[RegressionSpec(name="ok", x_column="z", y_column="y")],
+            persist_derived_id="derived-clean",
+        )
+        assert math.isclose(ok_res.regressions[0].slope, 1.0, rel_tol=1e-12)
+        assert ws.resolve_path("datasets/derived-clean.json").is_file()
+        assert ws.verify_provenance().ok
+
+        # Extreme scale OLS (1e200 and 1e-200) must stay finite and accurate via rescaling
+        huge = run_ols_regression([1e200, 2e200, 3e200], [2e200, 4e200, 6e200], name="huge")
+        assert math.isclose(huge.slope, 2.0, rel_tol=1e-12)
+        assert huge.intercept_se is not None and math.isfinite(huge.intercept_se)
+        tiny = run_ols_regression(
+            [1e-200, 2e-200, 3e-200],
+            [2e-200, 4e-200, 6e-200],
+            name="tiny",
+            intercept="zero",
+        )
+        assert math.isclose(tiny.slope, 2.0, rel_tol=1e-12)
+        assert math.isfinite(tiny.slope_se)
+
+        # Poorly-fit zero-intercept OLS can legitimately have negative centered R^2
+        bad_zero = run_ols_regression(
+            [1.0, 2.0, 3.0],
+            [100.0, 100.0, 101.0],
+            name="neg-r2",
+            intercept="zero",
+        )
+        assert bad_zero.r_squared < 0.0

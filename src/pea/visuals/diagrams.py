@@ -25,6 +25,7 @@ from pea.config import PeaConfig
 from pea.schemas import DiagramElement, DiagramSpec, ProvenanceSource, ReportFigure
 from pea.visuals.plots import (
     ACADEMIC_PALETTE,
+    _assert_provenance_safe_write,
     _save_figure_dual,
     academic_rc_params,
     configure_bundled_fonts,
@@ -35,6 +36,10 @@ if TYPE_CHECKING:
     from pea.workspace import RunWorkspace
 
 _DEFAULT_DIAGRAM_DPI = 300
+_MIN_DIAGRAM_DPI = 72
+_MAX_DIAGRAM_DPI = 600
+_MIN_WAVE_POINTS = 16
+_MAX_WAVE_POINTS = 10_000
 
 # Two-terminal circuit elements (accept direction, length, at, to)
 _CIRCUIT_TWO_TERMINAL: dict[str, type[Any]] = {
@@ -73,10 +78,21 @@ class DiagramError(ValueError):
     """Raised when a diagram specification contains unsupported or invalid elements."""
 
 
+def _require_finite(val: Any, context: str) -> float:
+    if isinstance(val, bool):
+        raise DiagramError(f"Expected numeric value for {context}; got boolean {val!r}")
+    try:
+        out = float(val)
+    except (TypeError, ValueError) as exc:
+        raise DiagramError(f"Invalid numeric value for {context}: {val!r}") from exc
+    if not math.isfinite(out):
+        raise DiagramError(f"Non-finite numeric value for {context}: {val!r}")
+    return out
+
+
 def _validate_point(pt: tuple[float, float], context: str) -> tuple[float, float]:
-    x, y = float(pt[0]), float(pt[1])
-    if not (math.isfinite(x) and math.isfinite(y)):
-        raise DiagramError(f"Non-finite coordinates in {context}: {pt!r}")
+    x = _require_finite(pt[0], f"{context}[0]")
+    y = _require_finite(pt[1], f"{context}[1]")
     return (x, y)
 
 
@@ -85,7 +101,10 @@ def _apply_circuit_style(element: Any, style: dict[str, Any]) -> Any:
         element = element.color(str(style["color"]))
     lw = style.get("lw", style.get("linewidth"))
     if lw is not None:
-        element = element.linewidth(float(lw))
+        lw_val = _require_finite(lw, "style.linewidth")
+        if lw_val <= 0.0:
+            raise DiagramError(f"style.linewidth must be positive; got {lw_val!r}")
+        element = element.linewidth(lw_val)
     ls = style.get("ls", style.get("linestyle"))
     if ls is not None:
         element = element.linestyle(str(ls))
@@ -132,14 +151,25 @@ def _render_circuit(spec: DiagramSpec, fig: Figure) -> None:
                 cls = elm.ResistorIEC
             obj = cls(**kwargs)
 
+            start_pt: tuple[float, float] | None = None
             if el.at is not None:
-                obj = obj.at(_validate_point(el.at, f"elements[{idx}].at"))
+                start_pt = _validate_point(el.at, f"elements[{idx}].at")
+                obj = obj.at(start_pt)
             if el.to is not None:
-                obj = obj.to(_validate_point(el.to, f"elements[{idx}].to"))
+                end_pt = _validate_point(el.to, f"elements[{idx}].to")
+                if start_pt is not None and start_pt == end_pt:
+                    raise DiagramError(
+                        f"Circuit element at index {idx} has identical 'at' and 'to': {start_pt}"
+                    )
+                # Source/Meter subclasses in schemdraw==0.23 default elmparams['theta']=90,
+                # which would override .to() orientation unless cleared first.
+                obj.elmparams.pop("theta", None)
+                obj.elmparams.pop("d", None)
+                obj = obj.to(end_pt)
             else:
                 obj = getattr(obj, el.direction)()
                 if el.length is not None:
-                    obj = obj.length(float(el.length))
+                    obj = obj.length(_require_finite(el.length, f"elements[{idx}].length"))
 
             obj = _apply_circuit_style(obj, style)
             if el.label:
@@ -187,17 +217,17 @@ def _resolve_vector_endpoints(
 
     style = el.style
     if "magnitude" in style:
-        mag = float(style["magnitude"])
-        if not math.isfinite(mag):
-            raise DiagramError(f"Non-finite magnitude at elements[{idx}]")
+        mag = _require_finite(style["magnitude"], f"elements[{idx}].style.magnitude")
         if "angle_rad" in style:
-            ang = float(style["angle_rad"])
+            ang = _require_finite(style["angle_rad"], f"elements[{idx}].style.angle_rad")
         else:
-            ang = math.radians(float(style.get("angle_deg", 0.0)))
+            ang = math.radians(
+                _require_finite(style.get("angle_deg", 0.0), f"elements[{idx}].style.angle_deg")
+            )
         end = (start[0] + mag * math.cos(ang), start[1] + mag * math.sin(ang))
         return start, end
 
-    length = float(el.length) if el.length is not None else 1.0
+    length = _require_finite(el.length, f"elements[{idx}].length") if el.length is not None else 1.0
     dx, dy = {
         "right": (length, 0.0),
         "left": (-length, 0.0),
@@ -286,9 +316,17 @@ def _render_phasor(spec: DiagramSpec, fig: Figure) -> None:
 
         elif kind in ("arc", "angle"):
             cx, cy = _validate_point(el.at, f"elements[{idx}].at") if el.at else (0.0, 0.0)
-            radius = float(el.length) if el.length is not None else 0.35
-            start_deg = float(style.get("start_deg", 0.0))
-            end_deg = float(style.get("end_deg", 45.0))
+            radius = (
+                _require_finite(el.length, f"elements[{idx}].length")
+                if el.length is not None
+                else 0.35
+            )
+            start_deg = _require_finite(
+                style.get("start_deg", 0.0), f"elements[{idx}].style.start_deg"
+            )
+            end_deg = _require_finite(
+                style.get("end_deg", 45.0), f"elements[{idx}].style.end_deg"
+            )
             theta1, theta2 = (start_deg, end_deg) if end_deg >= start_deg else (end_deg, start_deg)
             arc = Arc(
                 (cx, cy),
@@ -298,7 +336,7 @@ def _render_phasor(spec: DiagramSpec, fig: Figure) -> None:
                 theta1=theta1,
                 theta2=theta2,
                 color=color,
-                linewidth=float(style.get("lw", 1.4)),
+                linewidth=_require_finite(style.get("lw", 1.4), f"elements[{idx}].style.lw"),
                 zorder=3,
             )
             ax.add_patch(arc)
@@ -312,14 +350,18 @@ def _render_phasor(spec: DiagramSpec, fig: Figure) -> None:
 
         elif kind == "circle":
             cx, cy = _validate_point(el.at, f"elements[{idx}].at") if el.at else (0.0, 0.0)
-            radius = float(el.length) if el.length is not None else 1.0
+            radius = (
+                _require_finite(el.length, f"elements[{idx}].length")
+                if el.length is not None
+                else 1.0
+            )
             circle = Circle(
                 (cx, cy),
                 radius,
                 fill=False,
                 edgecolor=color,
                 linestyle=str(style.get("ls", ":")),
-                linewidth=float(style.get("lw", 1.1)),
+                linewidth=_require_finite(style.get("lw", 1.1), f"elements[{idx}].style.lw"),
                 zorder=2,
             )
             ax.add_patch(circle)
@@ -327,21 +369,42 @@ def _render_phasor(spec: DiagramSpec, fig: Figure) -> None:
             _track(cx + radius, cy + radius)
 
         elif kind in ("wave", "sine", "cosine"):
-            amp = float(style.get("amplitude", 1.0))
-            omega = float(style.get("omega", 2.0 * math.pi))
-            phase = (
-                float(style["phase_rad"])
-                if "phase_rad" in style
-                else math.radians(float(style.get("phase_deg", 0.0)))
+            amp = _require_finite(
+                style.get("amplitude", 1.0), f"elements[{idx}].style.amplitude"
             )
-            t_min = float(style.get("t_min", 0.0))
-            t_max = float(style.get("t_max", 2.0))
-            n_pts = int(style.get("points", 400))
-            t = np.linspace(t_min, t_max, max(32, n_pts))
+            omega = _require_finite(
+                style.get("omega", 2.0 * math.pi), f"elements[{idx}].style.omega"
+            )
+            phase = (
+                _require_finite(style["phase_rad"], f"elements[{idx}].style.phase_rad")
+                if "phase_rad" in style
+                else math.radians(
+                    _require_finite(
+                        style.get("phase_deg", 0.0), f"elements[{idx}].style.phase_deg"
+                    )
+                )
+            )
+            t_min = _require_finite(style.get("t_min", 0.0), f"elements[{idx}].style.t_min")
+            t_max = _require_finite(style.get("t_max", 2.0), f"elements[{idx}].style.t_max")
+            if t_max <= t_min:
+                raise DiagramError(
+                    f"Wave element at index {idx} requires t_max > t_min; got [{t_min}, {t_max}]"
+                )
+            raw_pts = style.get("points", 400)
+            if isinstance(raw_pts, bool) or not isinstance(raw_pts, int):
+                raise DiagramError(f"Wave points must be an integer; got {raw_pts!r}")
+            if not (_MIN_WAVE_POINTS <= raw_pts <= _MAX_WAVE_POINTS):
+                raise DiagramError(
+                    f"Wave points must lie in [{_MIN_WAVE_POINTS}, {_MAX_WAVE_POINTS}]; "
+                    f"got {raw_pts}"
+                )
+            t = np.linspace(t_min, t_max, raw_pts)
             fn_name = str(style.get("func", "sin" if kind == "sine" else "cos")).lower()
             y = amp * (np.sin(omega * t + phase) if fn_name == "sin" else np.cos(omega * t + phase))
             ls = str(style.get("ls", style.get("linestyle", "-")))
-            lw = float(style.get("lw", style.get("linewidth", 1.9)))
+            lw = _require_finite(
+                style.get("lw", style.get("linewidth", 1.9)), f"elements[{idx}].style.lw"
+            )
             ax.plot(t, y, color=color, linestyle=ls, linewidth=lw, label=el.label or None, zorder=3)
             if el.label:
                 has_legend = True
@@ -559,8 +622,14 @@ def _render_field(spec: DiagramSpec, fig: Figure) -> None:
 
         elif kind in ("dipole", "magnet"):
             cx, cy = _validate_point(el.at, f"elements[{idx}].at") if el.at else (0.0, 0.0)
-            w = float(el.length) if el.length is not None else 1.6
-            h = float(style.get("height", 0.45))
+            w = (
+                _require_finite(el.length, f"elements[{idx}].length")
+                if el.length is not None
+                else 1.6
+            )
+            h = _require_finite(style.get("height", 0.45), f"elements[{idx}].style.height")
+            if h <= 0.0:
+                raise DiagramError(f"Dipole height must be positive; got {h!r}")
             ax.add_patch(
                 Rectangle(
                     (cx - w / 2, cy - h / 2),
@@ -673,6 +742,10 @@ def render_diagram(
     """
     diag_spec = spec if isinstance(spec, DiagramSpec) else DiagramSpec.model_validate(spec)
     diagram_id = validate_figure_id(diag_spec.diagram_id)
+    if isinstance(dpi, bool) or not (_MIN_DIAGRAM_DPI <= dpi <= _MAX_DIAGRAM_DPI):
+        raise DiagramError(
+            f"Diagram dpi must lie in [{_MIN_DIAGRAM_DPI}, {_MAX_DIAGRAM_DPI}]; got {dpi!r}"
+        )
 
     workspace.ensure_dirs()
     svg_rel = f"figures/{diagram_id}.svg"
@@ -680,11 +753,12 @@ def render_diagram(
     svg_path = workspace.resolve_path(svg_rel)
     png_path = workspace.resolve_path(png_rel)
 
-    if not overwrite and (svg_path.exists() or png_path.exists()):
-        raise FileExistsError(
-            f"Diagram artifacts for {diagram_id!r} already exist in run {workspace.run_id}; "
-            "choose a unique diagram_id to preserve provenance immutability"
-        )
+    _assert_provenance_safe_write(
+        workspace,
+        (svg_rel, png_rel),
+        entity_label=f"diagram {diagram_id!r}",
+        overwrite=overwrite,
+    )
 
     font_stack = configure_bundled_fonts(config)
     with matplotlib.rc_context(academic_rc_params(font_stack)):
@@ -724,7 +798,7 @@ def render_diagram(
 
     return ReportFigure(
         figure_id=diagram_id,
-        caption=diag_spec.title or diagram_id,
+        caption=diag_spec.title.strip() or diagram_id,
         svg_relpath=svg_rel,
         png_relpath=png_rel,
         source=source,

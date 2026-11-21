@@ -7,6 +7,7 @@ for full English + Cyrillic glyph coverage without any external network calls.
 from __future__ import annotations
 
 import math
+import os
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -91,18 +92,64 @@ def academic_rc_params(font_stack: list[str]) -> dict[str, Any]:
     }
 
 
-def _validate_finite_sequence(values: list[float], label: str) -> None:
+def _validate_finite_sequence(
+    values: list[float],
+    label: str,
+    *,
+    non_negative: bool = False,
+) -> None:
     for idx, val in enumerate(values):
         if isinstance(val, bool) or not math.isfinite(float(val)):
             raise ValueError(f"Non-finite coordinate in {label}[{idx}]: {val!r}")
+        if non_negative and float(val) < 0.0:
+            raise ValueError(f"Negative error bar in {label}[{idx}]: {val!r}")
+
+
+def _assert_provenance_safe_write(
+    workspace: RunWorkspace,
+    relpaths: tuple[str, ...],
+    *,
+    entity_label: str,
+    overwrite: bool,
+) -> None:
+    """Enforce overwrite guard and protect existing ``provenance.jsonl`` hashes."""
+    if not overwrite:
+        for rel in relpaths:
+            if workspace.resolve_path(rel).exists():
+                raise FileExistsError(
+                    f"Artifacts for {entity_label} already exist in run {workspace.run_id}; "
+                    "choose a unique ID to preserve provenance immutability"
+                )
+        return
+
+    recorded = {entry.relpath for entry in workspace.read_provenance()}
+    conflicts = [rel for rel in relpaths if rel in recorded]
+    if conflicts:
+        raise FileExistsError(
+            f"Cannot overwrite provenance-recorded artifact(s) {conflicts} in run "
+            f"{workspace.run_id}; choose a unique ID to preserve provenance integrity"
+        )
 
 
 def _save_figure_dual(fig: Figure, svg_path: Path, png_path: Path, *, dpi: int) -> None:
-    """Export *fig* to both vector SVG and high-DPI PNG without using global pyplot state."""
-    FigureCanvasSVG(fig)
-    fig.savefig(svg_path, format="svg", bbox_inches="tight", pad_inches=0.12)
-    FigureCanvasAgg(fig)
-    fig.savefig(png_path, format="png", dpi=dpi, bbox_inches="tight", pad_inches=0.12)
+    """Atomically export *fig* to vector SVG and high-DPI PNG without global pyplot state."""
+    svg_tmp = svg_path.with_suffix(".svg.tmp")
+    png_tmp = png_path.with_suffix(".png.tmp")
+    try:
+        FigureCanvasSVG(fig)
+        fig.savefig(svg_tmp, format="svg", bbox_inches="tight", pad_inches=0.12)
+        FigureCanvasAgg(fig)
+        fig.savefig(png_tmp, format="png", dpi=dpi, bbox_inches="tight", pad_inches=0.12)
+        os.replace(svg_tmp, svg_path)
+        os.replace(png_tmp, png_path)
+    except Exception:
+        for tmp in (svg_tmp, png_tmp):
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+        raise
 
 
 def render_plot(
@@ -124,9 +171,9 @@ def render_plot(
         _validate_finite_sequence(series.x, f"series[{idx}].x")
         _validate_finite_sequence(series.y, f"series[{idx}].y")
         if series.x_err is not None:
-            _validate_finite_sequence(series.x_err, f"series[{idx}].x_err")
+            _validate_finite_sequence(series.x_err, f"series[{idx}].x_err", non_negative=True)
         if series.y_err is not None:
-            _validate_finite_sequence(series.y_err, f"series[{idx}].y_err")
+            _validate_finite_sequence(series.y_err, f"series[{idx}].y_err", non_negative=True)
 
     workspace.ensure_dirs()
     svg_rel = f"figures/{plot_id}.svg"
@@ -134,11 +181,12 @@ def render_plot(
     svg_path = workspace.resolve_path(svg_rel)
     png_path = workspace.resolve_path(png_rel)
 
-    if not overwrite and (svg_path.exists() or png_path.exists()):
-        raise FileExistsError(
-            f"Plot artifacts for {plot_id!r} already exist in run {workspace.run_id}; "
-            "choose a unique plot_id to preserve provenance immutability"
-        )
+    _assert_provenance_safe_write(
+        workspace,
+        (svg_rel, png_rel),
+        entity_label=f"plot {plot_id!r}",
+        overwrite=overwrite,
+    )
 
     font_stack = configure_bundled_fonts(config)
     with matplotlib.rc_context(academic_rc_params(font_stack)):
@@ -220,8 +268,9 @@ def render_plot(
             if plot_spec.equal_aspect:
                 ax.set_aspect("equal", adjustable="box")
 
+            legend_obj = None
             if plot_spec.legend and has_labeled_series:
-                ax.legend(
+                legend_obj = ax.legend(
                     frameon=True,
                     facecolor="#ffffff",
                     edgecolor="#cbd5e1",
@@ -231,14 +280,25 @@ def render_plot(
                 )
 
             if plot_spec.annotations:
+                ann_x, ann_y, ann_ha, ann_va = 0.025, 0.97, "left", "top"
+                if legend_obj is not None:
+                    # Inspect resolved legend position to avoid overlapping top-left annotations
+                    FigureCanvasAgg(fig)
+                    fig.canvas.draw()
+                    renderer = fig.canvas.get_renderer()  # type: ignore[attr-defined]
+                    leg_bbox = legend_obj.get_window_extent(renderer).transformed(
+                        ax.transAxes.inverted()
+                    )
+                    if leg_bbox.x0 < 0.45 and leg_bbox.y1 > 0.65:
+                        ann_x, ann_y, ann_ha, ann_va = 0.975, 0.03, "right", "bottom"
                 annotation_text = "\n".join(plot_spec.annotations)
                 ax.text(
-                    0.025,
-                    0.97,
+                    ann_x,
+                    ann_y,
                     annotation_text,
                     transform=ax.transAxes,
-                    va="top",
-                    ha="left",
+                    va=ann_va,
+                    ha=ann_ha,
                     fontsize=8.6,
                     color="#0f172a",
                     bbox={
@@ -270,7 +330,7 @@ def render_plot(
 
     return ReportFigure(
         figure_id=plot_id,
-        caption=plot_spec.title or plot_id,
+        caption=plot_spec.title.strip() or plot_id,
         svg_relpath=svg_rel,
         png_relpath=png_rel,
         source=source,

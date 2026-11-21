@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -339,6 +340,116 @@ class TestPhysicsCalculations:
         expected_z_sigma = math.hypot(0.6 * 0.1, 0.8 * 0.1)
         assert z_unc.uncertainty_si is not None
         assert math.isclose(z_unc.uncertainty_si, expected_z_sigma, rel_tol=1e-12)
+
+        # Holomorphic complex transcendental & sqrt uncertainty: Re(exp(j*phi)) and |sqrt(R+j*X)|
+        exp_unc = calc_eval(
+            CalcRequest(
+                expression="re(exp(j * phi))",
+                variables={"phi": CalcVariable(value=math.pi / 4.0, uncertainty=0.1)},
+            )
+        )
+        assert exp_unc.uncertainty_si is not None
+        assert math.isclose(exp_unc.uncertainty_si, math.sin(math.pi / 4.0) * 0.1, rel_tol=1e-12)
+
+        sqrt_unc = calc_eval(
+            CalcRequest(
+                expression="abs(sqrt(R + j * X))",
+                variables={
+                    "R": CalcVariable(value=3.0, uncertainty=0.1),
+                    "X": CalcVariable(value=4.0, uncertainty=0.1),
+                },
+            )
+        )
+        # |sqrt(R+jX)| = (R^2+X^2)^(1/4) -> d/dR = R / (2*(R^2+X^2)^(3/4))
+        expected_sqrt_sigma = math.hypot(3.0 / (2.0 * 5.0**1.5) * 0.1, 4.0 / (2.0 * 5.0**1.5) * 0.1)
+        assert sqrt_unc.uncertainty_si is not None
+        assert math.isclose(sqrt_unc.uncertainty_si, expected_sqrt_sigma, rel_tol=1e-12)
+
+        # Vector uncertainty propagation through vec(), scalar*vec, cross(), norm(), and dot()
+        vec_unc = calc_eval(
+            CalcRequest(
+                expression="norm(vec(vx, vy, vz))",
+                variables={
+                    "vx": CalcVariable(value=3.0, unit="m/s", uncertainty=0.1),
+                    "vy": CalcVariable(value=4.0, unit="m/s", uncertainty=0.2),
+                    "vz": CalcVariable(value=0.0, unit="m/s"),
+                },
+            )
+        )
+        assert vec_unc.uncertainty_si is not None
+        assert math.isclose(vec_unc.uncertainty_si, math.hypot(0.6 * 0.1, 0.8 * 0.2), rel_tol=1e-12)
+
+        lorentz_unc = calc_eval(
+            CalcRequest(
+                expression="norm(q * cross(v, B))",
+                variables={
+                    "q": CalcVariable(value=2.0, unit="C", uncertainty=0.1),
+                    "v": CalcVariable(value=[3.0, 0.0, 0.0], unit="m/s"),
+                    "B": CalcVariable(value=[0.0, 4.0, 0.0], unit="T"),
+                },
+                output_unit="N",
+            )
+        )
+        assert lorentz_unc.uncertainty_si is not None
+        assert math.isclose(lorentz_unc.uncertainty_si, 1.2, rel_tol=1e-12)
+
+        # Negative base integer power & dimensional atan2 uncertainty
+        neg_pow = calc_eval(
+            CalcRequest(
+                expression="x**3",
+                variables={"x": CalcVariable(value=-2.0, uncertainty=0.1)},
+            )
+        )
+        assert neg_pow.uncertainty_si is not None
+        assert math.isclose(neg_pow.uncertainty_si, 1.2, rel_tol=1e-12)
+
+        angle_unc = calc_eval(
+            CalcRequest(
+                expression="atan2(y, x)",
+                variables={
+                    "y": CalcVariable(value=4.0, unit="m", uncertainty=0.1),
+                    "x": CalcVariable(value=3.0, unit="m", uncertainty=0.1),
+                },
+            )
+        )
+        assert angle_unc.uncertainty_si is not None
+        assert math.isclose(angle_unc.uncertainty_si, 0.02, rel_tol=1e-12)
+
+    def test_extreme_scales_and_blank_output_unit_guards(self) -> None:
+        # Very small non-zero values must not trigger spurious derivative ZeroDivisionError
+        ratio = calc_eval(CalcRequest(expression="1e-200 / 1e-200"))
+        assert math.isclose(float(ratio.output_value), 1.0, rel_tol=1e-12)
+        arg_tiny = calc_eval(CalcRequest(expression="arg(1e-200 + 1e-200 * j)"))
+        assert math.isclose(float(arg_tiny.output_value), math.pi / 4.0, rel_tol=1e-12)
+        atan2_tiny = calc_eval(CalcRequest(expression="atan2(1e-200, 1e-200)"))
+        assert math.isclose(float(atan2_tiny.output_value), math.pi / 4.0, rel_tol=1e-12)
+
+        # Derivative overflow must raise CalcError, not raw OverflowError
+        with pytest.raises(CalcError):
+            calc_eval(
+                CalcRequest(
+                    expression="x**-1",
+                    variables={"x": CalcVariable(value=1e-200, uncertainty=1e-205)},
+                )
+            )
+
+        # Whitespace-only output_unit must raise UnitParseError, not Pydantic ValidationError
+        with pytest.raises(UnitParseError):
+            calc_eval(CalcRequest(expression="1 + 1", output_unit="   "))
+
+    def test_concurrent_calculation_ledger_writes(self, tmp_path: Path) -> None:
+        mgr = WorkspaceManager(tmp_path / "runs")
+        ws = mgr.create_run(label="concurrent-calc")
+
+        def _worker(i: int) -> str:
+            return calc_eval(CalcRequest(expression=f"{i} * 3 + 1"), workspace=ws).calc_id
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            ids = list(pool.map(_worker, range(24)))
+
+        loaded = load_calculations(ws)
+        assert len(loaded) == 24
+        assert set(loaded.keys()) == set(ids)
 
     def test_dimensional_mismatch_errors(self) -> None:
         with pytest.raises(DimensionError):
