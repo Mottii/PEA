@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pea-mcp"
+version = "0.2.0"
+description = "Physics Experiments Automation (PEA v2) — zero-API-cost deterministic MCP server, universal simulator engine, physics math, and academic report compiler."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "mcp",
+    "pydantic>=2.10",
+    "playwright",
+    "rapidocr==3.10.0",
+    "onnxruntime==1.32.0",
+    "pillow",
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "schemdraw",
+    "pypdfium2",
+    "pypdf",
+    "python-docx",
+    "starlette",
+    "uvicorn",
+    "httpx",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+]
+
+[project.scripts]
+pea-mcp = "pea.mcp_server:main"
+pea-viewer = "pea.viewer.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pea"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "live_sim: tests that launch headless Chromium and Ruffle against local SWF simulators",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]

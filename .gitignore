@@ -1,0 +1,28 @@
+# Python environments & caches
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+
+# OS & editor artifacts
+.DS_Store
+*.tmp
+
+# PEA runtime, local offline assets, bundles & local calibration overrides
+local_assets/
+runs/
+dist/
+profiles/local/
+
+# Binary lab simulators, handouts, reports, ONNX models & WASM bundles
+*.swf
+*.pdf
+*.docx
+*.zip
+*.onnx
+*.wasm
+*.mcpb
