@@ -354,6 +354,10 @@ table.data-table tbody tr:last-child td {
   border-left: 2.8pt solid var(--navy);
   border-radius: 2.5pt;
   background: #ffffff;
+}
+
+.qa-card.card-compact,
+.problem-card.card-compact {
   break-inside: avoid;
   page-break-inside: avoid;
 }
@@ -506,6 +510,11 @@ table.data-table tbody tr:last-child td {
   display: flex;
   flex-direction: column;
   gap: 2pt;
+}
+
+.sha-mismatch {
+  color: var(--crimson);
+  font-weight: 700;
 }
 
 .empty-notice {

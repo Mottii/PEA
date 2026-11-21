@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
-from pydantic import Field, field_validator
+from pydantic import Field, ValidationError, field_validator
 
 from pea.config import PathConfinementError, PeaConfig, resolve_confined_path
 from pea.math_engine.calculator import load_calculations
@@ -22,6 +22,7 @@ from pea.report.pdf_builder import (
     load_template,
     provenance_badge_html,
     render_html_to_pdf,
+    render_template_tokens,
     validate_report_filename,
 )
 from pea.schemas import (
@@ -165,15 +166,25 @@ def build_evidence_zip(
     # Optional external calibration profile files (e.g. profiles/local/<sha256>.json)
     extra_entries: list[tuple[str, Path]] = []
     seen_arcnames = {arc for arc, _ in entries}
+    seen_resolved = {fp for _, fp in entries}
     if profile_paths:
         for raw_p in profile_paths:
             p = Path(raw_p).expanduser().resolve()
             if not p.is_file() or _is_temp_file(p):
                 raise FileNotFoundError(f"Calibration profile not found: {p.name}")
+            if p in seen_resolved:
+                continue
             arcname = f"profiles/{p.name}"
-            if arcname not in seen_arcnames:
-                seen_arcnames.add(arcname)
-                extra_entries.append((arcname, p))
+            if arcname in seen_arcnames:
+                suffix = p.suffix
+                stem = p.stem
+                idx = 2
+                while f"profiles/{stem}-{idx}{suffix}" in seen_arcnames:
+                    idx += 1
+                arcname = f"profiles/{stem}-{idx}{suffix}"
+            seen_resolved.add(p)
+            seen_arcnames.add(arcname)
+            extra_entries.append((arcname, p))
 
     all_entries = sorted([*entries, *extra_entries], key=lambda item: item[0])
 
@@ -250,15 +261,33 @@ def _encode_relpath_url(relpath: str) -> str:
     return "/".join(quote(part, safe="") for part in relpath.split("/") if part)
 
 
+def _read_provenance_lenient(workspace: RunWorkspace) -> list[ProvenanceEntry]:
+    """Parse all valid lines of ``provenance.jsonl``, skipping malformed lines for audit reports."""
+    if not workspace.provenance_path.is_file():
+        return []
+    entries: list[ProvenanceEntry] = []
+    with workspace.provenance_path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            try:
+                entries.append(ProvenanceEntry.model_validate_json(stripped))
+            except ValidationError:
+                continue
+    return entries
+
+
 def _collect_evidence_screenshots(
     workspace: RunWorkspace,
     provenance_by_rel: dict[str, ProvenanceEntry],
     *,
     max_screenshots: int,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], int]:
     shots: list[dict[str, Any]] = []
+    total_found = 0
     if not workspace.evidence_dir.is_dir():
-        return shots
+        return shots, 0
 
     for path in sorted(workspace.evidence_dir.rglob("*"), key=lambda p: p.as_posix()):
         if not path.is_file() or _is_temp_file(path):
@@ -269,29 +298,35 @@ def _collect_evidence_screenshots(
             resolved = resolve_confined_path(workspace.root, path)
         except PathConfinementError:
             continue
+        total_found += 1
+        if len(shots) >= max_screenshots:
+            continue
+
         relpath = resolved.relative_to(workspace.root).as_posix()
+        actual_digest, actual_size = sha256_file(resolved)
         prov = provenance_by_rel.get(relpath)
         if prov is not None:
-            digest = prov.sha256
-            size_bytes = prov.size_bytes
+            ledger_digest = prov.sha256
+            tampered = actual_digest != prov.sha256 or actual_size != prov.size_bytes
             source = prov.source
             timestamp = prov.timestamp.isoformat()
         else:
-            digest, size_bytes = sha256_file(resolved)
+            ledger_digest = None
+            tampered = False
             source = "simulator_captured"
             timestamp = "—"
         shots.append(
             {
                 "relpath": relpath,
-                "sha256": digest,
-                "size_bytes": size_bytes,
+                "sha256": actual_digest,
+                "ledger_sha256": ledger_digest,
+                "tampered": tampered,
+                "size_bytes": actual_size,
                 "source": source,
                 "timestamp": timestamp,
             }
         )
-        if len(shots) >= max_screenshots:
-            break
-    return shots
+    return shots, total_found
 
 
 def render_teacher_evidence_html(
@@ -304,10 +339,17 @@ def render_teacher_evidence_html(
     run_prefix: str = "/run",
 ) -> tuple[str, int, bool]:
     """Render the Teacher Evidence Audit Packet HTML; returns ``(html, shot_count, prov_ok)``."""
+    if (
+        isinstance(max_screenshots, bool)
+        or not isinstance(max_screenshots, int)
+        or max_screenshots < 1
+    ):
+        raise ValueError(f"max_screenshots must be an integer >= 1; got {max_screenshots!r}")
+
     labels = REPORT_LABELS[language]
     doc_title = title.strip() if title and title.strip() else labels["teacher_default_title"]
 
-    entries = workspace.read_provenance()
+    entries = _read_provenance_lenient(workspace)
     prov_check = workspace.verify_provenance()
     provenance_by_rel = {e.relpath: e for e in entries}
     calcs = load_calculations(workspace)
@@ -322,7 +364,7 @@ def render_teacher_evidence_html(
         except Exception:
             status_phase = "unreadable"
 
-    shots = _collect_evidence_screenshots(
+    shots, total_shots = _collect_evidence_screenshots(
         workspace,
         provenance_by_rel,
         max_screenshots=max_screenshots,
@@ -348,6 +390,9 @@ def render_teacher_evidence_html(
         if prov_check.ok
         else f'<span class="badge badge-fail">{_esc(labels["teacher_failed"])}</span>'
     )
+    shots_card_val = (
+        f"{len(shots)} / {total_shots}" if total_shots > len(shots) else str(len(shots))
+    )
     summary_parts = [
         '<div class="summary-cards">',
         (
@@ -365,7 +410,7 @@ def render_teacher_evidence_html(
         (
             '<div class="summary-card">'
             f'<div class="summary-card-label">{_esc(labels["teacher_screenshots"])}</div>'
-            f'<div class="summary-card-value">{len(shots)}</div>'
+            f'<div class="summary-card-value">{_esc(shots_card_val)}</div>'
             "</div>"
         ),
         (
@@ -376,6 +421,9 @@ def render_teacher_evidence_html(
         ),
         "</div>",
     ]
+    if total_shots > len(shots):
+        trunc_msg = labels["teacher_shots_truncated"].format(shown=len(shots), total=total_shots)
+        summary_parts.append(f'<div class="empty-notice">{_esc(trunc_msg)}</div>')
     if prov_check.errors:
         err_items = "".join(f"<li>{_esc(e)}</li>" for e in prov_check.errors)
         summary_parts.append(
@@ -422,24 +470,41 @@ def render_teacher_evidence_html(
         for idx, shot in enumerate(shots, start=1):
             img_url = f"{run_prefix.rstrip('/')}/{_encode_relpath_url(shot['relpath'])}"
             badge = provenance_badge_html(shot["source"], language)
+            if shot["tampered"]:
+                badge = (
+                    f'{badge} <span class="badge badge-fail">'
+                    f'{_esc(labels["teacher_failed"])}</span>'
+                )
             heading_line = (
                 f'<h2 class="section-heading">{_esc(labels["teacher_shots_heading"])}</h2>\n'
                 if idx == 1
                 else ""
             )
+            if shot["tampered"] and shot["ledger_sha256"]:
+                sha_lines = (
+                    f'      <div class="sha-mismatch">'
+                    f'<strong>{_esc(labels["teacher_actual_sha256"])}:</strong> '
+                    f'<span class="sha-cell">{_esc(shot["sha256"])}</span></div>\n'
+                    f'      <div><strong>{_esc(labels["teacher_ledger_sha256"])}:</strong> '
+                    f'<span class="sha-cell">{_esc(shot["ledger_sha256"])}</span></div>\n'
+                )
+            else:
+                sha_lines = (
+                    f'      <div><strong>{_esc(labels["sha256"])}:</strong> '
+                    f'<span class="sha-cell">{_esc(shot["sha256"])}</span></div>\n'
+                )
             shot_pages.append(
                 f'<section class="evidence-page">\n'
                 f"  {heading_line}"
                 f'  <div class="evidence-shot">\n'
                 f'    <div class="evidence-shot-header">\n'
                 f'      <strong class="mono">#{idx} · {_esc(shot["relpath"])}</strong>\n'
-                f"      {badge}\n"
+                f"      <span>{badge}</span>\n"
                 f"    </div>\n"
                 f'    <img class="evidence-shot-img" src="{_esc(img_url)}" '
                 f'alt="{_esc(shot["relpath"])}" />\n'
                 f'    <div class="evidence-shot-footer">\n'
-                f'      <div><strong>{_esc(labels["sha256"])}:</strong> '
-                f'<span class="sha-cell">{_esc(shot["sha256"])}</span></div>\n'
+                f"{sha_lines}"
                 f'      <div><strong>{_esc(labels["size_bytes"])}:</strong> '
                 f"{shot['size_bytes']} · "
                 f'<strong>{_esc(labels["teacher_captured_at"])}:</strong> '
@@ -458,16 +523,22 @@ def render_teacher_evidence_html(
         )
 
     clean_asset_prefix = asset_prefix.rstrip("/")
-    css = load_template("report.css").replace("{{ASSET_PREFIX}}", clean_asset_prefix)
+    css = render_template_tokens(
+        load_template("report.css"),
+        {"{{ASSET_PREFIX}}": clean_asset_prefix},
+    )
     template = load_template("teacher_evidence.html")
-    rendered = (
-        template.replace("{{LANG}}", language)
-        .replace("{{DOC_TITLE}}", _esc(doc_title))
-        .replace("{{REPORT_CSS}}", css)
-        .replace("{{MASTHEAD_HTML}}", "\n".join(masthead_parts))
-        .replace("{{SUMMARY_HTML}}", "\n".join(summary_parts))
-        .replace("{{INDEX_HTML}}", index_html)
-        .replace("{{SCREENSHOTS_HTML}}", screenshots_html)
+    rendered = render_template_tokens(
+        template,
+        {
+            "{{LANG}}": language,
+            "{{DOC_TITLE}}": _esc(doc_title),
+            "{{REPORT_CSS}}": css,
+            "{{MASTHEAD_HTML}}": "\n".join(masthead_parts),
+            "{{SUMMARY_HTML}}": "\n".join(summary_parts),
+            "{{INDEX_HTML}}": index_html,
+            "{{SCREENSHOTS_HTML}}": screenshots_html,
+        },
     )
     return rendered, len(shots), prov_check.ok
 

@@ -203,6 +203,9 @@ def inspect_pdf(
                 f"Password-protected PDF cannot be read without password: {pdf_file.name}"
             )
 
+    if len(reader.pages) < 1:
+        raise ValueError("PDF document contains zero pages")
+
     try:
         pdf_doc = pdfium.PdfDocument(str(pdf_file))
     except Exception as exc:

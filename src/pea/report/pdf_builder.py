@@ -99,6 +99,7 @@ REPORT_LABELS: dict[ReportLanguage, dict[str, Any]] = {
             "model_computed": "Model Computed",
         },
         "teacher_kicker": "PEA v2 — Instructor Audit Packet",
+        "teacher_title_suffix": "Evidence Packet",
         "teacher_default_title": "Experimental Evidence & Provenance Packet",
         "teacher_run_id": "Run ID",
         "teacher_status": "Run Status",
@@ -112,6 +113,9 @@ REPORT_LABELS: dict[ReportLanguage, dict[str, Any]] = {
         "teacher_shots_heading": "2. Raw Evidence Screenshots",
         "teacher_no_shots": "No raw evidence screenshots were found in this run.",
         "teacher_captured_at": "Timestamp (UTC)",
+        "teacher_actual_sha256": "Actual Disk SHA-256",
+        "teacher_ledger_sha256": "Recorded Ledger SHA-256",
+        "teacher_shots_truncated": "Showing first {shown} of {total} evidence screenshots.",
     },
     "ru": {
         "lab_prefix": "Лабораторная работа",
@@ -157,6 +161,7 @@ REPORT_LABELS: dict[ReportLanguage, dict[str, Any]] = {
             "model_computed": "Расчётная модель",
         },
         "teacher_kicker": "PEA v2 — Пакет подтверждающих материалов",
+        "teacher_title_suffix": "Пакет подтверждающих материалов",
         "teacher_default_title": "Пакет первичных данных и контрольных сумм",
         "teacher_run_id": "ID запуска",
         "teacher_status": "Статус запуска",
@@ -170,6 +175,9 @@ REPORT_LABELS: dict[ReportLanguage, dict[str, Any]] = {
         "teacher_shots_heading": "2. Первичные скриншоты измерений",
         "teacher_no_shots": "В данном запуске скриншоты в каталоге evidence/ отсутствуют.",
         "teacher_captured_at": "Метка времени (UTC)",
+        "teacher_actual_sha256": "Фактический SHA-256 на диске",
+        "teacher_ledger_sha256": "SHA-256 в реестре",
+        "teacher_shots_truncated": "Показаны первые {shown} из {total} скриншотов.",
     },
 }
 
@@ -211,10 +219,24 @@ def assert_provenance_safe_report_write(
         )
 
 
+_TEMPLATE_TOKEN_RE = re.compile(r"\{\{[A-Z0-9_]+\}\}")
+_DISPLAY_MATH_RE = re.compile(r"(\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\])")
+_LATEX_BEGIN_RE = re.compile(r"\\begin\{[^{}]+\}")
+_LATEX_END_RE = re.compile(r"\\end\{[^{}]+\}")
+
+
 def load_template(name: str) -> str:
     """Read a template file from ``src/pea/report/templates/``."""
     target = resolve_confined_path(_TEMPLATES_DIR, name)
     return target.read_text(encoding="utf-8")
+
+
+def render_template_tokens(template: str, replacements: dict[str, str]) -> str:
+    """Perform single-pass ``{{TOKEN}}`` substitution without re-expanding user content."""
+    return _TEMPLATE_TOKEN_RE.sub(
+        lambda match: replacements.get(match.group(0), match.group(0)),
+        template,
+    )
 
 
 def _esc(text: str) -> str:
@@ -229,9 +251,6 @@ def _encode_relpath_url(relpath: str) -> str:
 def _format_scalar(val: float) -> str:
     if val == 0.0:
         return "0"
-    abs_val = abs(val)
-    if abs_val >= 1e5 or abs_val < 1e-3:
-        return f"{val:.6g}"
     return f"{val:.6g}"
 
 
@@ -279,16 +298,54 @@ def _strip_outer_math_delimiters(equation: str) -> str:
     return s
 
 
+def split_equation_blocks(raw: str) -> list[str]:
+    """Split an equation field into blocks without shattering ``\\begin{...}`` environments."""
+    cleaned = raw.strip()
+    if not cleaned:
+        return []
+
+    if _LATEX_BEGIN_RE.search(cleaned) or r"\\" in cleaned:
+        blocks: list[str] = []
+        current: list[str] = []
+        env_depth = 0
+        for line in cleaned.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                if env_depth == 0 and current:
+                    blocks.append("\n".join(current))
+                    current = []
+                elif current:
+                    current.append("")
+                continue
+            env_depth += len(_LATEX_BEGIN_RE.findall(stripped))
+            current.append(stripped)
+            env_depth = max(0, env_depth - len(_LATEX_END_RE.findall(stripped)))
+        if current:
+            blocks.append("\n".join(current))
+        return [b for b in blocks if b.strip()]
+
+    return [line.strip() for line in cleaned.splitlines() if line.strip()]
+
+
 def _render_paragraphs_html(text: str) -> str:
     cleaned = text.strip()
     if not cleaned:
         return ""
-    blocks = re.split(r"\n\s*\n", cleaned)
+    segments = _DISPLAY_MATH_RE.split(cleaned)
     parts: list[str] = []
-    for block in blocks:
-        lines = [_esc(line.strip()) for line in block.splitlines() if line.strip()]
-        if lines:
-            parts.append(f"<p>{'<br />'.join(lines)}</p>")
+    for idx, segment in enumerate(segments):
+        if idx % 2 == 1:
+            eq_html = _render_equation_block_html(segment)
+            if eq_html:
+                parts.append(eq_html)
+            continue
+        seg_clean = segment.strip()
+        if not seg_clean:
+            continue
+        for block in re.split(r"\n\s*\n", seg_clean):
+            lines = [_esc(line.strip()) for line in block.splitlines() if line.strip()]
+            if lines:
+                parts.append(f"<p>{'<br />'.join(lines)}</p>")
     return "\n".join(parts)
 
 
@@ -318,14 +375,21 @@ def _render_figure_html(
     *,
     run_prefix: str,
     language: ReportLanguage,
+    seen_fig_ids: dict[str, int] | None = None,
 ) -> str:
     labels = REPORT_LABELS[language]
     relpath = _resolve_figure_relpath(fig, workspace)
     img_url = f"{run_prefix.rstrip('/')}/{_encode_relpath_url(relpath)}"
     badge = provenance_badge_html(fig.source, language)
     fig_word = labels["figure_label"]
+    dom_id = f"fig-{fig.figure_id}"
+    if seen_fig_ids is not None:
+        count = seen_fig_ids.get(fig.figure_id, 0) + 1
+        seen_fig_ids[fig.figure_id] = count
+        if count > 1:
+            dom_id = f"fig-{fig.figure_id}-{count}"
     return (
-        f'<figure class="figure-block" id="fig-{_esc(fig.figure_id)}">\n'
+        f'<figure class="figure-block" id="{_esc(dom_id)}">\n'
         f'  <img class="figure-img" src="{_esc(img_url)}" alt="{_esc(fig.caption)}" />\n'
         f'  <figcaption class="figure-caption-bar">\n'
         f'    <span class="figure-caption"><strong>{_esc(fig_word)} {fig_num}.</strong> '
@@ -580,6 +644,7 @@ def render_report_html(
     sec_num = 0
     fig_counter = 0
     tbl_counter = 0
+    seen_fig_ids: dict[str, int] = {}
 
     def _section(title: str, inner_html: str) -> None:
         nonlocal sec_num
@@ -616,9 +681,8 @@ def render_report_html(
             if body:
                 block_parts.append(_render_paragraphs_html(body))
             if eq:
-                for eq_line in eq.splitlines():
-                    if eq_line.strip():
-                        block_parts.append(_render_equation_block_html(eq_line))
+                for eq_block in split_equation_blocks(eq):
+                    block_parts.append(_render_equation_block_html(eq_block))
             if block_parts:
                 theory_blocks.append("\n".join(block_parts))
         if theory_blocks:
@@ -643,6 +707,7 @@ def render_report_html(
                     workspace,
                     run_prefix=run_prefix,
                     language=lang,
+                    seen_fig_ids=seen_fig_ids,
                 )
             )
         _section(labels["results"], "\n".join(res_blocks))
@@ -684,10 +749,18 @@ def render_report_html(
                         workspace,
                         run_prefix=run_prefix,
                         language=lang,
+                        seen_fig_ids=seen_fig_ids,
                     )
                 )
+            qa_compact = (
+                not item.figure_ids
+                and len(item.equations) <= 2
+                and len(item.question) + len(item.answer) <= 900
+                and len(re.split(r"\n\s*\n", item.answer.strip())) <= 3
+            )
+            compact_cls = " card-compact" if qa_compact else ""
             qa_cards.append(
-                f'<article class="qa-card">\n'
+                f'<article class="qa-card{compact_cls}">\n'
                 f'  <div class="qa-card-header">'
                 f'<span class="qa-number">{_esc(labels["question_prefix"])} '
                 f"{_esc(item.number)}.</span> {_esc(item.question)}</div>\n"
@@ -715,10 +788,18 @@ def render_report_html(
                         workspace,
                         run_prefix=run_prefix,
                         language=lang,
+                        seen_fig_ids=seen_fig_ids,
                     )
                 )
+            prob_compact = (
+                not item.figure_ids
+                and len(item.calc_ids) <= 4
+                and len(item.prompt) + len(item.solution) <= 900
+                and len(re.split(r"\n\s*\n", item.solution.strip())) <= 3
+            )
+            compact_cls = " card-compact" if prob_compact else ""
             prob_cards.append(
-                f'<article class="problem-card">\n'
+                f'<article class="problem-card{compact_cls}">\n'
                 f'  <div class="problem-card-header">'
                 f'<span class="problem-number">{_esc(labels["problem_prefix"])} '
                 f"{_esc(item.number)}.</span> {_esc(item.prompt)}</div>\n"
@@ -739,15 +820,21 @@ def render_report_html(
         )
 
     clean_asset_prefix = asset_prefix.rstrip("/")
-    css = load_template("report.css").replace("{{ASSET_PREFIX}}", clean_asset_prefix)
+    css = render_template_tokens(
+        load_template("report.css"),
+        {"{{ASSET_PREFIX}}": clean_asset_prefix},
+    )
     template = load_template("report.html")
-    return (
-        template.replace("{{LANG}}", lang)
-        .replace("{{DOC_TITLE}}", _esc(report.title))
-        .replace("{{ASSET_PREFIX}}", clean_asset_prefix)
-        .replace("{{REPORT_CSS}}", css)
-        .replace("{{MASTHEAD_HTML}}", "\n".join(masthead_parts))
-        .replace("{{BODY_HTML}}", "\n".join(body_sections))
+    return render_template_tokens(
+        template,
+        {
+            "{{LANG}}": lang,
+            "{{DOC_TITLE}}": _esc(report.title),
+            "{{ASSET_PREFIX}}": clean_asset_prefix,
+            "{{REPORT_CSS}}": css,
+            "{{MASTHEAD_HTML}}": "\n".join(masthead_parts),
+            "{{BODY_HTML}}": "\n".join(body_sections),
+        },
     )
 
 
@@ -772,11 +859,14 @@ class _OfflineRenderServer:
     ) -> None:
         if not is_loopback_host(host):
             raise ValueError(f"Offline render server requires a loopback host; got {host!r}")
+        normalized_host = host.strip()
+        if normalized_host.startswith("[") and normalized_host.endswith("]"):
+            normalized_host = normalized_host[1:-1]
         self._html_bytes = html_content.encode("utf-8")
         self._katex_dir = (assets_dir / "katex").resolve()
         self._fonts_dir = (assets_dir / "fonts").resolve()
         self._run_root = run_root.resolve()
-        self._host = host
+        self._host = normalized_host
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self.origin: str = ""
@@ -933,6 +1023,7 @@ async def render_html_to_pdf(
     origin = server.start()
 
     blocked_requests: list[str] = []
+    failed_local_assets: list[str] = []
     page_errors: list[str] = []
     katex_errors: list[str] = []
     output_pdf_path.parent.mkdir(parents=True, exist_ok=True)
@@ -954,6 +1045,13 @@ async def render_html_to_pdf(
         )
         page = await context.new_page()
         page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+
+        def _on_response(response: Any) -> None:
+            url = response.url
+            if url.startswith(f"{origin}/assets/") and response.status >= 400:
+                failed_local_assets.append(f"{response.status} {url.removeprefix(origin)}")
+
+        page.on("response", _on_response)
 
         async def _route_guard(route: Any) -> None:
             url = route.request.url
@@ -997,6 +1095,16 @@ async def render_html_to_pdf(
             raise RuntimeError(
                 f"Blocked disallowed external network request(s) during offline PDF render: "
                 f"{blocked_requests}"
+            )
+        if failed_local_assets:
+            raise RuntimeError(
+                f"Failed to load required offline report asset(s) from local_assets: "
+                f"{failed_local_assets}"
+            )
+        if wait_for_katex and any("renderMathInElement not available" in e for e in katex_errors):
+            raise RuntimeError(
+                "Offline KaTeX auto-render script failed to initialize "
+                "(renderMathInElement not available)"
             )
 
         pdf_kwargs: dict[str, Any] = {
@@ -1064,7 +1172,7 @@ def preview_report_pages(
         raise ValueError(f"dpi must be an integer in 72..600; got {dpi!r}")
     if isinstance(max_pages, bool) or not isinstance(max_pages, int) or max_pages < 1:
         raise ValueError(f"max_pages must be an integer >= 1; got {max_pages!r}")
-    if not _FILENAME_RE.match(prefix):
+    if prefix in (".", "..") or not _FILENAME_RE.match(prefix):
         raise PathConfinementError(f"Invalid preview filename prefix: {prefix!r}")
 
     resolved_pdf = workspace.resolve_path(pdf_path)
@@ -1164,6 +1272,18 @@ async def build_report_pdf(
 
     html_content = render_report_html(report, workspace)
 
+    pdf_path = workspace.resolve_path(pdf_relpath)
+    render_meta = await render_html_to_pdf(
+        html_content,
+        pdf_path,
+        workspace,
+        config=config,
+        title=report.title,
+        language=report.language,
+        display_header_footer=True,
+        wait_for_katex=True,
+    )
+
     if save_html:
         html_path = workspace.resolve_path(html_relpath)
         tmp_html = html_path.with_name(f"{html_path.name}.tmp")
@@ -1177,18 +1297,6 @@ async def build_report_pdf(
                 except OSError:
                     pass
             raise
-
-    pdf_path = workspace.resolve_path(pdf_relpath)
-    render_meta = await render_html_to_pdf(
-        html_content,
-        pdf_path,
-        workspace,
-        config=config,
-        title=report.title,
-        language=report.language,
-        display_header_footer=True,
-        wait_for_katex=True,
-    )
 
     page_count = count_pdf_pages(pdf_path)
     entry = workspace.record_artifact(
@@ -1238,5 +1346,7 @@ __all__ = [
     "provenance_badge_html",
     "render_html_to_pdf",
     "render_report_html",
+    "render_template_tokens",
+    "split_equation_blocks",
     "validate_report_filename",
 ]

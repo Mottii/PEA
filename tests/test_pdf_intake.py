@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pypdf
 import pytest
 from PIL import Image
 
@@ -143,3 +144,49 @@ def test_inspect_pdf_edge_cases_and_validation(tmp_path: Path) -> None:
         with pytest.raises(PathConfinementError):
             inspect_pdf(LAB5_HANDOUT, ws, max_pages=1, subdir="../escape")
     assert cfg.local_assets_dir.is_dir()
+
+
+def test_inspect_pdf_encrypted_zero_page_and_rotated_pdfs(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path)
+
+    # 1. Password-protected PDF rejected cleanly
+    enc_writer = pypdf.PdfWriter()
+    enc_writer.add_blank_page(width=200, height=300)
+    enc_writer.encrypt(user_password="secret", owner_password="owner")
+    enc_pdf = tmp_path / "encrypted.pdf"
+    with enc_pdf.open("wb") as fh:
+        enc_writer.write(fh)
+    with pytest.raises(ValueError, match="Password-protected PDF"):
+        inspect_pdf(enc_pdf, ws, subdir="enc")
+
+    # 2. Owner-only encrypted PDF (empty user password) succeeds
+    owner_writer = pypdf.PdfWriter()
+    owner_writer.add_blank_page(width=200, height=300)
+    owner_writer.encrypt(user_password="", owner_password="owner")
+    owner_pdf = tmp_path / "owner-only.pdf"
+    with owner_pdf.open("wb") as fh:
+        owner_writer.write(fh)
+    owner_res = inspect_pdf(owner_pdf, ws, dpi=72, subdir="owner")
+    assert owner_res.rendered_pages == 1
+    assert owner_res.pages[0].width_px == 200
+    assert owner_res.pages[0].height_px == 300
+
+    # 3. Zero-page PDF raises explicit zero-pages ValueError
+    zero_writer = pypdf.PdfWriter()
+    zero_pdf = tmp_path / "zero.pdf"
+    with zero_pdf.open("wb") as fh:
+        zero_writer.write(fh)
+    with pytest.raises(ValueError, match="zero pages"):
+        inspect_pdf(zero_pdf, ws, subdir="zero")
+
+    # 4. Rotated 90-degree page (200x400 -> 400x200 at 72 DPI)
+    rot_writer = pypdf.PdfWriter()
+    page = rot_writer.add_blank_page(width=200, height=400)
+    page.rotate(90)
+    rot_pdf = tmp_path / "rotated.pdf"
+    with rot_pdf.open("wb") as fh:
+        rot_writer.write(fh)
+    rot_res = inspect_pdf(rot_pdf, ws, dpi=72, subdir="rot")
+    assert rot_res.pages[0].width_px == 400
+    assert rot_res.pages[0].height_px == 200
+    assert ws.verify_provenance().ok is True

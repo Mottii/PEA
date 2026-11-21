@@ -89,10 +89,11 @@ async def build_report(
         docx_sha256 = docx_res.docx_sha256
 
     if include_teacher_packet:
+        teacher_suffix = REPORT_LABELS[report.language]["teacher_title_suffix"]
         teacher_res = await build_teacher_evidence_pdf(
             workspace,
             config=config,
-            title=f"{report.title} — Evidence Packet",
+            title=f"{report.title} — {teacher_suffix}",
             language=report.language,
             overwrite=overwrite,
         )

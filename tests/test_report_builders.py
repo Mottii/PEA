@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
 import urllib.error
 import urllib.request
 import zipfile
@@ -26,6 +27,7 @@ from pea.report import (
     preview_report_pages,
     render_html_to_pdf,
     render_report_html,
+    render_teacher_evidence_html,
 )
 from pea.report.pdf_builder import _OfflineRenderServer
 from pea.schemas import (
@@ -43,7 +45,7 @@ from pea.schemas import (
     SelfControlItem,
 )
 from pea.visuals import render_diagram, render_plot
-from pea.workspace import RunWorkspace, WorkspaceManager
+from pea.workspace import RunWorkspace, WorkspaceManager, sha256_file
 
 
 def _make_config(tmp_path: Path) -> PeaConfig:
@@ -753,4 +755,303 @@ async def test_edge_cases_symlink_exclusion_svg_only_docx_and_tampered_teacher_p
     t_text = "\n".join(p.extract_text() or "" for p in t_reader.pages)
     assert "INTEGRITY ERROR" in t_text
     assert "No raw evidence screenshots" in t_text
+
+
+@pytest.mark.asyncio
+async def test_template_injection_multiline_latex_and_docx_fidelity(tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path)
+    wm = WorkspaceManager.from_config(cfg)
+    ws = wm.create_run(label="run-{{INDEX_HTML}}")
+
+    # 1. Single-pass template substitution prevents {{TOKEN}} double-expansion
+    inj_spec = ReportSpec(
+        title="Title {{BODY_HTML}} and {{REPORT_CSS}}",
+        objective="Check $a < b < c$ and Cyrillic $\\text{привет}$:\n$$\n\\begin{aligned}\n"
+        "a &= b + c \\\\\nd &= e + f\n\\end{aligned}\n$$",
+        theory_sections=[
+            {
+                "heading": "Resonance at $\\omega_0$",
+                "body": "Coupled system:",
+                "equation": (
+                    "\\begin{aligned}\n"
+                    "\\omega_0 &= \\frac{1}{\\sqrt{LC}} \\\\\n"
+                    "Q &= \\frac{1}{R}\\sqrt{\\frac{L}{C}}\n"
+                    "\\end{aligned}"
+                ),
+            }
+        ],
+        options=ReportSectionOptions(include_self_control=True, include_evidence_appendix=True),
+        self_control=[
+            SelfControlItem(
+                number="1",
+                question="Explain $R \\in \\{3.2, 4.0\\}\\,\\Omega$ and $L = 5{,}0\\text{ мГн}$.",
+                answer="First paragraph with $\\varepsilon_0 \\cos(\\omega t)$.\n\n"
+                "Second paragraph preserved separately.",
+                equations=[r"\begin{aligned} x &= 1 \\ y &= 2 \end{aligned}"],
+            )
+        ],
+    )
+    # Record a file containing '$' in its name to verify provenance table isn't mangled in DOCX
+    dollar_rel = "evidence/cost$1.png"
+    im = Image.new("RGB", (60, 40), (20, 40, 60))
+    im.save(ws.resolve_path(dollar_rel), format="PNG")
+    im.close()
+    ws.record_artifact(dollar_rel, kind="sim_screenshot", source="simulator_captured")
+
+    html_doc = render_report_html(inj_spec, ws)
+    title_tag = html_doc.split("<title>")[1].split("</title>")[0]
+    assert title_tag == "Title {{BODY_HTML}} and {{REPORT_CSS}}"
+    assert html_doc.count('class="equation-block"') == 3  # objective + theory + self_control
+
+    teacher_html, _, _ = render_teacher_evidence_html(ws, title="Audit {{SCREENSHOTS_HTML}}")
+    t_title = teacher_html.split("<title>")[1].split("</title>")[0]
+    assert t_title == "Audit {{SCREENSHOTS_HTML}}"
+
+    # 2. Multi-line \begin{aligned} renders cleanly through Chromium KaTeX with zero errors
+    pdf_res = await build_report_pdf(inj_spec, ws, config=cfg, render_previews=False)
+    pdf_prov = [e for e in ws.read_provenance() if e.kind == "report_pdf"][-1]
+    assert pdf_prov.details["katex_errors"] == []
+    pdf_txt = "\n".join(
+        p.extract_text() or ""
+        for p in pypdf.PdfReader(str(ws.resolve_path(pdf_res.pdf_relpath or ""))).pages
+    )
+    assert "\\begin{aligned}" not in pdf_txt
+    assert "a < b < c" in pdf_txt
+    assert "привет" in pdf_txt
+
+    # 3. DOCX preserves multi-paragraph Q&A, strips LaTeX tokens, keeps literal relpath intact
+    docx_res = build_report_docx(inj_spec, ws)
+    parsed = docx.Document(str(ws.resolve_path(docx_res.docx_relpath or "")))
+    para_texts = [p.text for p in parsed.paragraphs]
+    assert any("Resonance at ω_0" in t for t in para_texts)
+    assert any("First paragraph" in t and "Second paragraph" not in t for t in para_texts)
+    assert any("Second paragraph preserved separately." in t for t in para_texts)
+    assert not any("\\quad" in t or "\\in" in t or "\\cos" in t or "{,}" in t for t in para_texts)
+    # Provenance table retains exact '$' in relpath
+    prov_table = parsed.tables[-1]
+    assert any(cell.text == dollar_rel for row in prov_table.rows for cell in row.cells)
+
+    # 4. Extended latex_to_readable_text coverage
+    assert "\\" not in latex_to_readable_text(
+        r"$$\omega_0 = \frac{1}{\sqrt{LC}}, \quad R \in \{3.2, 4.0\}\,\Omega, "
+        r"\qquad L = 5{,}0\text{ мГн}, \varepsilon_0 \cos(\omega t)$$"
+    )
+    assert "\\" not in latex_to_readable_text(r"\begin{aligned} a &= b \\ c &= d \end{aligned}")
+
+
+@pytest.mark.asyncio
+async def test_missing_local_assets_orphan_cleanup_ipv6_and_audit_hardening(
+    tmp_path: Path,
+) -> None:
+    cfg = _make_config(tmp_path)
+    wm = WorkspaceManager.from_config(cfg)
+
+    # 1. Missing KaTeX / font assets fail hard AND leave zero orphan reports/report.html
+    empty_assets = tmp_path / "empty_assets"
+    (empty_assets / "katex").mkdir(parents=True)
+    (empty_assets / "fonts").mkdir(parents=True)
+    bad_assets_cfg = PeaConfig(
+        project_root=cfg.project_root,
+        local_assets_dir=empty_assets,
+        runs_dir=cfg.runs_dir,
+        profiles_dir=cfg.profiles_dir,
+        loopback_host="127.0.0.1",
+        browser_executable=cfg.browser_executable,
+    )
+    ws_missing = wm.create_run(label="missing-katex")
+    with pytest.raises(RuntimeError, match="offline report asset|renderMathInElement"):
+        await build_report_pdf(
+            ReportSpec(title="Missing Assets", objective="Test $\\omega_0$."),
+            ws_missing,
+            config=bad_assets_cfg,
+            render_previews=False,
+        )
+    assert not ws_missing.resolve_path("reports/report.pdf").exists()
+    assert not ws_missing.resolve_path("reports/report.html").exists()
+
+    # 2. IPv6 loopback host (both '::1' and bracketed '[::1]') renders cleanly
+    for host_val in ("::1", "[::1]"):
+        cfg_v6 = PeaConfig(
+            project_root=cfg.project_root,
+            local_assets_dir=cfg.local_assets_dir,
+            runs_dir=cfg.runs_dir,
+            profiles_dir=cfg.profiles_dir,
+            loopback_host=host_val,
+            browser_executable=cfg.browser_executable,
+        )
+        ws_v6 = wm.create_run(label="ipv6-render")
+        res_v6 = await build_report_pdf(
+            ReportSpec(title=f"IPv6 Render {host_val}", objective="Verify IPv6 loopback."),
+            ws_v6,
+            config=cfg_v6,
+            render_previews=False,
+        )
+        assert res_v6.page_count == 1
+
+    # 3. preview_report_pages rejects '..' prefix
+    ws_prev = wm.create_run(label="prefix-guard")
+    res_prev = await build_report_pdf(
+        ReportSpec(title="Prefix Guard"), ws_prev, config=cfg, render_previews=False
+    )
+    with pytest.raises(PathConfinementError):
+        preview_report_pages(res_prev.pdf_relpath or "reports/report.pdf", ws_prev, prefix="..")
+
+    # 4. Duplicate basenames in profile_paths are disambiguated (not dropped)
+    ws_zip = wm.create_run(label="dup-profiles")
+    d1, d2 = tmp_path / "dir_a", tmp_path / "dir_b"
+    d1.mkdir()
+    d2.mkdir()
+    (d1 / "prof.json").write_text('{"variant": "A"}', encoding="utf-8")
+    (d2 / "prof.json").write_text('{"variant": "B"}', encoding="utf-8")
+    zres = build_evidence_zip(
+        ws_zip,
+        profile_paths=[d1 / "prof.json", d2 / "prof.json", d1 / "prof.json"],
+    )
+    with zipfile.ZipFile(ws_zip.resolve_path(zres.zip_relpath), "r") as zf:
+        prof_names = sorted(n for n in zf.namelist() if n.startswith("profiles/"))
+        assert set(prof_names) == {"profiles/prof.json", "profiles/prof-2.json"}
+        assert json.loads(zf.read("profiles/prof.json"))["variant"] == "A"
+        assert json.loads(zf.read("profiles/prof-2.json"))["variant"] == "B"
+
+    # 5. Russian build_report localizes Teacher Evidence Packet title
+    ws_ru = wm.create_run(label="ru-teacher-localized")
+    ru_res = await build_report(
+        ReportSpec(title="Лабораторная работа №5", language="ru", objective="Тест."),
+        ws_ru,
+        config=cfg,
+        formats=("pdf",),
+        include_teacher_packet=True,
+        render_previews=False,
+    )
+    ru_t_txt = (
+        pypdf.PdfReader(str(ws_ru.resolve_path(ru_res.teacher_packet_relpath or "")))
+        .pages[0]
+        .extract_text()
+        or ""
+    )
+    assert "Evidence Packet" not in ru_t_txt
+    assert "Пакет подтверждающих материалов" in ru_t_txt
+
+    # 6. Tampered screenshot shows actual disk SHA-256 + ledger SHA-256; corrupt provenance survives
+    ws_tamper = wm.create_run(label="tampered-audit")
+    for idx, color in enumerate(((10, 50, 90), (20, 80, 40)), start=1):
+        shot_p = ws_tamper.evidence_dir / f"shot-{idx}.png"
+        im = Image.new("RGB", (180, 100), color)
+        im.save(shot_p, format="PNG")
+        im.close()
+        ws_tamper.record_artifact(f"evidence/shot-{idx}.png", kind="sim_screenshot")
+
+    orig_sha = ws_tamper.read_provenance()[0].sha256
+    # Overwrite shot-1 with different valid PNG bytes
+    im_bad = Image.new("RGB", (180, 100), (220, 10, 10))
+    im_bad.save(ws_tamper.evidence_dir / "shot-1.png", format="PNG")
+    im_bad.close()
+    actual_sha, _ = sha256_file(ws_tamper.evidence_dir / "shot-1.png")
+    assert actual_sha != orig_sha
+
+    # Also append a malformed JSON line to provenance.jsonl
+    with ws_tamper.provenance_path.open("a", encoding="utf-8") as fh:
+        fh.write("{corrupted json line\n")
+
+    with pytest.raises(ValueError, match="max_screenshots"):
+        render_teacher_evidence_html(ws_tamper, max_screenshots=0)
+
+    t_res = await build_teacher_evidence_pdf(
+        ws_tamper,
+        config=cfg,
+        max_screenshots=1,
+        filename="corrupt-audit.pdf",
+    )
+    assert t_res.provenance_ok is False
+    assert t_res.screenshot_count == 1
+    t_pages = pypdf.PdfReader(str(ws_tamper.resolve_path(t_res.pdf_relpath))).pages
+    full_t_txt = unicodedata.normalize(
+        "NFKC", "\n".join(p.extract_text() or "" for p in t_pages)
+    )
+    assert "INTEGRITY ERROR" in full_t_txt
+    assert "invalid provenance JSON" in full_t_txt
+    assert "Showing first 1 of 2" in full_t_txt
+    assert actual_sha[:16] in full_t_txt
+    assert orig_sha[:16] in full_t_txt
+
+
+@pytest.mark.asyncio
+async def test_multipage_table_and_tall_problem_card_pagination(tmp_path: Path) -> None:
+    cfg = _make_config(tmp_path)
+    wm = WorkspaceManager.from_config(cfg)
+    ws = wm.create_run(label="pagination-stress")
+
+    fig_rel = "figures/shared.png"
+    im = Image.new("RGB", (600, 360), (31, 78, 121))
+    im.save(ws.resolve_path(fig_rel), format="PNG")
+    im.close()
+    ws.record_artifact(fig_rel, kind="plot_png", source="model_computed")
+    shared_fig = ReportFigure(
+        figure_id="shared_fig",
+        caption="Shared Phase Portrait",
+        png_relpath=fig_rel,
+        source="model_computed",
+    )
+
+    rows = [[str(i), f"{1000 + i * 10}", f"{2.5 + i * 0.03:.3f}"] for i in range(1, 36)]
+    long_sol = "\n\n".join(
+        f"Step {k}: Harmonic steady-state equation "
+        f"$L\\ddot{{q}} + R\\dot{{q}} + q/C = \\varepsilon_0\\cos(\\omega t)$."
+        for k in range(1, 16)
+    )
+    spec = ReportSpec(
+        title="Long Table & Oversized Card Pagination",
+        objective="Stress-test multi-page table header repetition and tall problem cards.",
+        tables=[
+            ReportTable(
+                table_id="tbl_35",
+                caption="35-Row Sweep Table",
+                headers=["#", "ω (rad/s)", "U₀C/ε₀"],
+                rows=rows,
+            )
+        ],
+        figures=[shared_fig],
+        options=ReportSectionOptions(include_self_control=True, include_problems=True),
+        self_control=[
+            SelfControlItem(
+                number="1",
+                question="Compact Q?",
+                answer="Short answer.",
+                figure_ids=[],
+            ),
+            SelfControlItem(
+                number="2",
+                question="Q referencing shared figure?",
+                answer="See figure below.",
+                figure_ids=["shared_fig"],
+            ),
+        ],
+        problems=[
+            ProblemItem(
+                number="1",
+                prompt="Long multi-paragraph derivation with shared figure.",
+                solution=long_sol,
+                figure_ids=["shared_fig"],
+            )
+        ],
+    )
+
+    html_doc = render_report_html(spec, ws)
+    # Compact Q&A card gets card-compact; tall/figure-bearing cards do not
+    assert 'class="qa-card card-compact"' in html_doc
+    assert 'class="problem-card"' in html_doc
+    # Shared figure referenced twice gets unique DOM IDs
+    assert 'id="fig-shared_fig"' in html_doc
+    assert 'id="fig-shared_fig-2"' in html_doc
+
+    res = await build_report_pdf(spec, ws, config=cfg, render_previews=False)
+    assert res.page_count >= 3
+    pages_txt = [
+        (p.extract_text() or "")
+        for p in pypdf.PdfReader(str(ws.resolve_path(res.pdf_relpath or ""))).pages
+    ]
+    # Header repeats on Page 2, and Self-Control starts on Page 2 without stranding Page 2 blank
+    assert "ω (rad/s)" in pages_txt[1]
+    assert "Self-Control Questions & Answers" in pages_txt[1]
+
 

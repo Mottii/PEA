@@ -21,6 +21,7 @@ from pea.report.pdf_builder import (
     assert_provenance_safe_report_write,
     format_calc_value,
     index_and_validate_figures,
+    split_equation_blocks,
     validate_report_filename,
 )
 from pea.schemas import (
@@ -61,31 +62,58 @@ _LATEX_SYMBOL_MAP: tuple[tuple[str, str], ...] = (
     (r"\psi", "ψ"),
     (r"\mu", "μ"),
     (r"\pi", "π"),
+    (r"\ell", "ℓ"),
+    (r"\hbar", "ℏ"),
+    (r"\nabla", "∇"),
     (r"\cdot", "·"),
     (r"\times", "×"),
+    (r"\div", "÷"),
     (r"\pm", "±"),
     (r"\mp", "∓"),
     (r"\approx", "≈"),
+    (r"\equiv", "≡"),
+    (r"\propto", "∝"),
+    (r"\sim", "~"),
     (r"\neq", "≠"),
     (r"\leq", "≤"),
     (r"\geq", "≥"),
     (r"\le", "≤"),
     (r"\ge", "≥"),
+    (r"\ll", "≪"),
+    (r"\gg", "≫"),
+    (r"\notin", "∉"),
+    (r"\in", "∈"),
+    (r"\subset", "⊂"),
     (r"\infty", "∞"),
-    (r"\to", "→"),
     (r"\rightarrow", "→"),
+    (r"\to", "→"),
     (r"\partial", "∂"),
+    (r"\sum", "∑"),
+    (r"\int", "∫"),
+    (r"\circ", "°"),
+    (r"\qquad", "   "),
+    (r"\quad", "  "),
     (r"\,", " "),
     (r"\;", " "),
     (r"\:", " "),
     (r"\!", ""),
     (r"\left", ""),
     (r"\right", ""),
+    (r"\{", "{"),
+    (r"\}", "}"),
+    (r"\%", "%"),
+    (r"\_", "_"),
 )
 
-_FRAC_RE = re.compile(r"\\frac\{([^{}]+)\}\{([^{}]+)\}")
+_ENV_WRAP_RE = re.compile(r"\\(?:begin|end)\{(?:aligned\*?|align\*?|gather\*?|split|equation\*?)\}")
+_FUNC_CMD_RE = re.compile(
+    r"\\(arcsin|arccos|arctan|sinh|cosh|tanh|sin|cos|tan|cot|sec|csc|ln|log|exp|max|min|lim|det|deg)\b"
+)
+_FRAC_RE = re.compile(r"\\(?:d|t)?frac\{([^{}]+)\}\{([^{}]+)\}")
+_SQRT_N_RE = re.compile(r"\\sqrt\[([^\[\]]+)\]\{([^{}]+)\}")
 _SQRT_RE = re.compile(r"\\sqrt\{([^{}]+)\}")
-_TEXT_WRAP_RE = re.compile(r"\\(?:text|mathrm|mathbf|operatorname)\{([^{}]+)\}")
+_TEXT_WRAP_RE = re.compile(r"\\(?:text|mathrm|mathbf|mathit|mathsf|operatorname)\{([^{}]+)\}")
+_ACCENT_WRAP_RE = re.compile(r"\\(?:vec|hat|bar|overline|tilde)\{([^{}]+)\}")
 
 
 def latex_to_readable_text(raw: str) -> str:
@@ -100,14 +128,27 @@ def latex_to_readable_text(raw: str) -> str:
         text = text.replace(r"\(", "").replace(r"\)", "")
         text = text.replace(r"\[", "").replace(r"\]", "")
 
-    for _ in range(4):
+    if _ENV_WRAP_RE.search(text):
+        text = _ENV_WRAP_RE.sub("", text)
+        text = text.replace(r"\\", "; ")
+        text = text.replace("&", " ")
+    else:
+        text = text.replace(r"\\", "; ")
+
+    # Russian decimal comma in math mode (e.g. 5{,}0 -> 5,0)
+    text = text.replace("{,}", ",")
+
+    for _ in range(5):
         updated = _TEXT_WRAP_RE.sub(r"\1", text)
+        updated = _ACCENT_WRAP_RE.sub(r"\1", updated)
         updated = _FRAC_RE.sub(r"(\1) / (\2)", updated)
+        updated = _SQRT_N_RE.sub(r"root(\1, \2)", updated)
         updated = _SQRT_RE.sub(r"√(\1)", updated)
         if updated == text:
             break
         text = updated
 
+    text = _FUNC_CMD_RE.sub(r"\1", text)
     for token, repl in _LATEX_SYMBOL_MAP:
         text = text.replace(token, repl)
 
@@ -237,6 +278,8 @@ def _add_styled_table(
     doc: Document,
     headers: list[str],
     rows: list[list[str]],
+    *,
+    format_math: bool = True,
 ) -> None:
     table = doc.add_table(rows=1 + len(rows), cols=len(headers))
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
@@ -251,7 +294,8 @@ def _add_styled_table(
         p = cell.paragraphs[0]
         p.paragraph_format.space_before = Pt(0)
         p.paragraph_format.space_after = Pt(0)
-        run = p.add_run(latex_to_readable_text(header_text))
+        display_hdr = latex_to_readable_text(header_text) if format_math else header_text
+        run = p.add_run(display_hdr)
         run.font.name = "Noto Sans"
         run.font.size = Pt(8.8)
         run.font.bold = True
@@ -269,7 +313,8 @@ def _add_styled_table(
             p = cell.paragraphs[0]
             p.paragraph_format.space_before = Pt(0)
             p.paragraph_format.space_after = Pt(0)
-            run = p.add_run(latex_to_readable_text(val))
+            display_val = latex_to_readable_text(val) if format_math else val
+            run = p.add_run(display_val)
             run.font.name = "Noto Sans"
             run.font.size = Pt(8.8)
             run.font.color.rgb = _BODY_RGB
@@ -572,13 +617,12 @@ def build_report_docx(
                 ).strip()
                 eq = (entry.get("equation") or entry.get("equations") or "").strip()
                 if heading:
-                    _add_subsection_heading(doc, heading)
+                    _add_subsection_heading(doc, latex_to_readable_text(heading))
                 if body:
                     _add_body_paragraphs(doc, body)
                 if eq:
-                    for eq_line in eq.splitlines():
-                        if eq_line.strip():
-                            _add_equation_paragraph(doc, eq_line)
+                    for eq_block in split_equation_blocks(eq):
+                        _add_equation_paragraph(doc, eq_block)
 
     if report.procedure:
         steps = [s for s in report.procedure if s.strip()]
@@ -632,6 +676,7 @@ def build_report_docx(
                 labels["provenance"],
             ],
             calc_rows,
+            format_math=False,
         )
 
     if report.conclusions:
@@ -666,6 +711,11 @@ def build_report_docx(
             r_q.font.bold = True
             r_q.font.color.rgb = _INK_RGB
 
+            answer_blocks = [
+                " ".join(ln.strip() for ln in blk.splitlines() if ln.strip())
+                for blk in re.split(r"\n\s*\n", item.answer.strip())
+                if blk.strip()
+            ] or [""]
             ap = doc.add_paragraph()
             ap.paragraph_format.space_before = Pt(0)
             ap.paragraph_format.space_after = Pt(4)
@@ -674,10 +724,12 @@ def build_report_docx(
             r_al.font.size = Pt(9.6)
             r_al.font.bold = True
             r_al.font.color.rgb = _MUTED_RGB
-            r_a = ap.add_run(latex_to_readable_text(item.answer))
+            r_a = ap.add_run(latex_to_readable_text(answer_blocks[0]))
             r_a.font.name = "Noto Sans"
             r_a.font.size = Pt(9.6)
             r_a.font.color.rgb = _BODY_RGB
+            for extra_blk in answer_blocks[1:]:
+                _add_body_paragraphs(doc, extra_blk)
 
             for eq in item.equations:
                 if eq.strip():
@@ -705,6 +757,11 @@ def build_report_docx(
             r_p.font.bold = True
             r_p.font.color.rgb = _INK_RGB
 
+            solution_blocks = [
+                " ".join(ln.strip() for ln in blk.splitlines() if ln.strip())
+                for blk in re.split(r"\n\s*\n", item.solution.strip())
+                if blk.strip()
+            ] or [""]
             sp = doc.add_paragraph()
             sp.paragraph_format.space_before = Pt(0)
             sp.paragraph_format.space_after = Pt(4)
@@ -713,10 +770,12 @@ def build_report_docx(
             r_sl.font.size = Pt(9.6)
             r_sl.font.bold = True
             r_sl.font.color.rgb = _MUTED_RGB
-            r_s = sp.add_run(latex_to_readable_text(item.solution))
+            r_s = sp.add_run(latex_to_readable_text(solution_blocks[0]))
             r_s.font.name = "Noto Sans"
             r_s.font.size = Pt(9.6)
             r_s.font.color.rgb = _BODY_RGB
+            for extra_blk in solution_blocks[1:]:
+                _add_body_paragraphs(doc, extra_blk)
 
             _add_calc_lines(doc, item.calc_ids, calc_ledger, language=lang)
             for fid in item.figure_ids:
@@ -750,6 +809,7 @@ def build_report_docx(
                     labels["sha256"],
                 ],
                 prov_rows,
+                format_math=False,
             )
 
     out_path = workspace.resolve_path(docx_relpath)
