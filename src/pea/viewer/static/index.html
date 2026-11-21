@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PEA v2 — Local Lab Viewer</title>
+  <link
+    rel="icon"
+    type="image/svg+xml"
+    href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231f4e79'/%3E%3Ctext x='16' y='21' text-anchor='middle' font-family='sans-serif' font-size='11' font-weight='700' fill='%23ffffff'%3EPEA%3C/text%3E%3C/svg%3E"
+  />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-brand">
+      <span class="brand-mark" aria-hidden="true">PEA</span>
+      <div class="brand-text">
+        <h1>PEA v2 Local Lab Viewer</h1>
+        <p class="brand-sub">Deterministic Loopback Monitor · Zero API Cost</p>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <span id="health-pill" class="pill pill-neutral">Connecting…</span>
+      <label class="toggle-control" for="auto-refresh">
+        <input type="checkbox" id="auto-refresh" checked />
+        <span>Auto-refresh</span>
+      </label>
+      <button type="button" id="refresh-btn" class="btn btn-secondary">Refresh</button>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <aside class="sidebar card" aria-label="Run History">
+      <div class="section-head">
+        <h2>Run History</h2>
+        <span id="run-count" class="muted-count">0 runs</span>
+      </div>
+      <div id="runs-list" class="runs-list" role="list">
+        <p class="empty-state">No runs found yet. Start a session with <code>pea-mcp</code>.</p>
+      </div>
+    </aside>
+
+    <section class="detail-pane" aria-label="Selected Run Details">
+      <div id="empty-detail" class="card empty-detail">
+        <h2>Select a laboratory run</h2>
+        <p>
+          Choose a run from the history list to inspect live captures, toggle OCR bounding boxes,
+          verify SHA-256 provenance, view vector figures, and download compiled PDF/DOCX/Evidence
+          artifacts.
+        </p>
+      </div>
+
+      <div id="run-detail" class="run-detail hidden">
+        <article class="card run-summary">
+          <div class="run-header">
+            <div class="run-title-group">
+              <div class="run-kicker">
+                <span id="detail-phase" class="pill pill-neutral">created</span>
+                <span id="detail-source" class="pill pill-source">simulator_captured</span>
+                <span id="detail-provenance-badge" class="pill pill-ok">SHA-256 Verified</span>
+              </div>
+              <h2 id="detail-title" class="run-title">Run</h2>
+              <p id="detail-run-id" class="mono run-id-line"></p>
+            </div>
+            <div class="run-meta">
+              <div><span class="meta-label">Updated:</span> <span id="detail-updated">—</span></div>
+              <div>
+                <span class="meta-label">Artifacts:</span>
+                <span id="detail-artifact-count">0</span>
+                <span class="meta-sep">·</span>
+                <span class="meta-label">Calcs:</span>
+                <span id="detail-calc-count">0</span>
+              </div>
+            </div>
+          </div>
+
+          <p id="detail-message" class="run-message hidden"></p>
+          <p id="detail-error" class="run-error hidden"></p>
+
+          <div id="progress-wrap" class="progress-wrap hidden">
+            <div class="progress-label-row">
+              <span>Progress</span>
+              <span id="progress-text" class="mono">0 / 0</span>
+            </div>
+            <div class="progress-track">
+              <div id="progress-fill" class="progress-fill"></div>
+            </div>
+          </div>
+
+          <div class="downloads-bar" id="downloads-bar"></div>
+        </article>
+
+        <article class="card capture-card">
+          <div class="section-head wrap-head">
+            <div>
+              <h3>Latest Capture</h3>
+              <p id="capture-caption" class="section-sub">No captures recorded for this run yet.</p>
+            </div>
+            <div class="capture-controls">
+              <select id="capture-select" class="select-input hidden" aria-label="Select capture"></select>
+              <label class="toggle-control" for="toggle-ocr">
+                <input type="checkbox" id="toggle-ocr" checked />
+                <span>OCR Boxes (<span id="ocr-box-count">0</span>)</span>
+              </label>
+              <label class="toggle-control hidden" id="annotated-toggle-wrap" for="toggle-annotated">
+                <input type="checkbox" id="toggle-annotated" />
+                <span>Annotated PNG</span>
+              </label>
+            </div>
+          </div>
+
+          <div id="capture-stage" class="capture-stage hidden">
+            <div class="stage-wrap">
+              <div class="stage-frame">
+                <img id="capture-img" alt="Latest laboratory simulator capture" />
+                <svg
+                  id="ocr-overlay"
+                  class="ocr-overlay"
+                  viewBox="0 0 1000 1000"
+                  preserveAspectRatio="none"
+                  aria-hidden="true"
+                ></svg>
+              </div>
+            </div>
+            <div id="ocr-list-wrap" class="ocr-list-wrap hidden">
+              <h4>Detected OCR Boxes</h4>
+              <div id="ocr-chips" class="ocr-chips"></div>
+            </div>
+          </div>
+          <p id="capture-empty" class="empty-state">No simulator or handout capture PNGs found in this run.</p>
+        </article>
+
+        <article class="card figures-card">
+          <div class="section-head">
+            <h3>Figures &amp; Schematics</h3>
+            <span id="figures-count" class="muted-count">0 figures</span>
+          </div>
+          <div id="figures-grid" class="figures-grid"></div>
+          <p id="figures-empty" class="empty-state">No plots or circuit diagrams rendered yet.</p>
+        </article>
+
+        <article class="card provenance-card">
+          <div class="section-head">
+            <h3>SHA-256 Provenance Ledger</h3>
+            <span id="provenance-summary-text" class="muted-count">0 entries</span>
+          </div>
+          <div id="provenance-errors" class="run-error hidden"></div>
+          <div class="table-scroll">
+            <table class="ledger-table">
+              <thead>
+                <tr>
+                  <th>Artifact</th>
+                  <th>Kind</th>
+                  <th>Source</th>
+                  <th class="num-col">Bytes</th>
+                  <th>SHA-256</th>
+                </tr>
+              </thead>
+              <tbody id="provenance-tbody"></tbody>
+            </table>
+          </div>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

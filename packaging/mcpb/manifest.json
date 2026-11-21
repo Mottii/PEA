@@ -1,0 +1,134 @@
+{
+  "manifest_version": "0.3",
+  "name": "pea-mcp",
+  "display_name": "PEA — Physics Experiments Automation",
+  "version": "0.2.0",
+  "description": "Zero-API-cost deterministic physics lab simulator control, offline ONNX OCR, dimensional math, OLS analysis, vector plots/schematics, and academic PDF/DOCX report compiler.",
+  "long_description": "PEA v2 connects Claude Desktop to a local Python 3.13 PEA workspace over MCP stdio with zero LLM API calls and zero API keys required. Exposes 16 universal laboratory tools and the read-only pea://policy resource.",
+  "author": {
+    "name": "PEA Contributors"
+  },
+  "license": "MIT",
+  "keywords": [
+    "physics",
+    "laboratory",
+    "mcp",
+    "simulator",
+    "ocr",
+    "scientific-computing",
+    "reports"
+  ],
+  "server": {
+    "type": "node",
+    "entry_point": "launcher.mjs",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/launcher.mjs"
+      ],
+      "env": {
+        "PEA_PROJECT_ROOT": "${user_config.project_folder}",
+        "PEA_ALLOWED_ORIGINS": "${user_config.allowed_origins}",
+        "PEA_OCR_BACKEND": "${user_config.ocr_backend}"
+      }
+    }
+  },
+  "user_config": {
+    "project_folder": {
+      "type": "directory",
+      "title": "PEA Project Folder",
+      "description": "Path to your local PEA v2 repository containing .venv/ and local_assets/.",
+      "required": true
+    },
+    "allowed_origins": {
+      "type": "string",
+      "title": "Allowed External HTML5 Origins (Optional)",
+      "description": "Comma-separated external HTTP(S) simulator origins (e.g. https://phet.colorado.edu). Leave empty for strict loopback-only mode.",
+      "required": false,
+      "default": ""
+    },
+    "ocr_backend": {
+      "type": "string",
+      "title": "OCR Backend",
+      "description": "Offline OCR backend ('rapidocr' recommended; 'macos_vision' optional with timeout fallback).",
+      "required": false,
+      "default": "rapidocr"
+    }
+  },
+  "tools": [
+    {
+      "name": "lab_inspect_pdf",
+      "description": "Render PDF handout pages to PNG and extract page-indexed text with SHA-256 provenance."
+    },
+    {
+      "name": "lab_runs",
+      "description": "List, inspect, create, or SHA-256-verify PEA execution run workspaces."
+    },
+    {
+      "name": "sim_open",
+      "description": "Open a local SWF (sandboxed Ruffle), local HTML5 simulator, or allowlisted URL."
+    },
+    {
+      "name": "sim_observe",
+      "description": "Capture a raw hashed PNG frame, run offline OCR, and optionally render an annotated grid overlay."
+    },
+    {
+      "name": "sim_act",
+      "description": "Execute atomic UI interactions and boundary-safe profile stepper actions."
+    },
+    {
+      "name": "sim_save_profile",
+      "description": "Validate live visibility and save a SHA-256-keyed simulator calibration profile."
+    },
+    {
+      "name": "sim_sweep",
+      "description": "Execute a deterministic N-dimensional parameter sweep with OCR verification and partial evidence."
+    },
+    {
+      "name": "sim_search_extremum",
+      "description": "Run closed-loop max, min, wide plateau_max, or threshold searches with boundary screenshots."
+    },
+    {
+      "name": "sim_close",
+      "description": "Close an active simulator session and stop its loopback server."
+    },
+    {
+      "name": "data_ingest",
+      "description": "Ingest inline rows or confined CSV/JSON datasets with explicit ProvenanceSource."
+    },
+    {
+      "name": "data_analyze",
+      "description": "Run safe AST derived column transforms, free/zero-intercept OLS regressions, and comparisons."
+    },
+    {
+      "name": "calc_eval",
+      "description": "Evaluate safe 5-dim SI dimensional expressions (complex AC, 3D vectors, uncertainties)."
+    },
+    {
+      "name": "plot_render",
+      "description": "Render scientific plots to vector SVG and 300 DPI PNG with bundled Noto Sans fonts."
+    },
+    {
+      "name": "diagram_render",
+      "description": "Render schemdraw circuit schematics and parametric phasor/waveform/field diagrams."
+    },
+    {
+      "name": "report_build",
+      "description": "Compile offline HTML+KaTeX academic reports to A4 PDF, editable DOCX, evidence.zip, and Teacher PDF."
+    },
+    {
+      "name": "report_preview",
+      "description": "Render compiled PDF report pages to PNG images for visual quality inspection."
+    }
+  ],
+  "compatibility": {
+    "platforms": [
+      "darwin",
+      "linux",
+      "win32"
+    ],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  }
+}
