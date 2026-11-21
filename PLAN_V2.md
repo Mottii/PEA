@@ -1,8 +1,8 @@
 # PEA v2 — Master Implementation Plan & Progress Tracker
 
-> **Current Status:** `Phase 1 Complete — Ready for Phase 2`
+> **Current Status:** `Phase 2A Complete — Ready for Phase 2B`
 > **Last Updated:** `2026-11-21`
-> **Phase Runbooks:** [`PHASE_0_PLAN.md`](./PHASE_0_PLAN.md) · [`PHASE_1_PLAN.md`](./PHASE_1_PLAN.md)
+> **Phase Runbooks:** [`PHASE_0_PLAN.md`](./PHASE_0_PLAN.md) · [`PHASE_1_PLAN.md`](./PHASE_1_PLAN.md) · [`PHASE_2_PLAN.md`](./PHASE_2_PLAN.md)
 
 This document is the single source of truth for rebuilding **PEA (Physics Experiments Automation)** into a universal, zero-API-cost MCP server, Agent Skill, Claude Desktop extension (`.mcpb`), and lightweight local viewer. Update the checkboxes and Progress Log below at the end of every phase or milestone.
 
@@ -17,7 +17,7 @@ This document is the single source of truth for rebuilding **PEA (Physics Experi
 | **Universal Experiment Scope** | **Zero hardcoded labs.** M1 delivers Interactive SWF/HTML5 control (`sim_open`, `sim_observe`, `sim_act`), Grid Sweep (`sim_sweep`), Closed-Loop Extremum/Plateau Search (`sim_search_extremum`), Bench-Data Ingest (`data_ingest`), and SHA-256 Calibration Profiles. M2 extends with Timed Transient Watch (`sim_watch`, e.g., Lab 3) and Sandboxed Numerical Compute (`compute_sim`). |
 | **Sandboxing & Security** | Loopback-only (`127.0.0.1`) by default for local `.swf` and HTML5 files; external HTML5 simulator domains require an explicit `PEA_ALLOWED_ORIGINS` allowlist. Ruffle runs with `allowScriptAccess: false` and `allowNetworking: 'none'`. Playwright blocks external network routes unless allowlisted. |
 | **Reports & Provenance** | Clean university submission layout by default with modular opt-in sections (**Self-Control Q&A**, **Additional Problems**). Compiled via **HTML + offline KaTeX + inline SVGs + Noto Sans → Playwright Chromium A4 PDF**, plus optional editable **`.docx`** (`python-docx`), separate **`evidence.zip`**, and optional **Teacher Evidence Packet PDF**. |
-| **Tech Stack** | Pure Python (`pyproject.toml` + `.venv`, **Python `3.13`** via permanent uv-managed toolchain — verified arm64 wheels for all 17 deps since `onnxruntime` lacks Python `3.14` wheels): official `mcp` (FastMCP) SDK, `playwright`, `numpy`, `scipy`, `matplotlib`, `schemdraw`, `pypdfium2`, `pypdf`, `python-docx`, `pillow`, `starlette`, `uvicorn`, `pydantic`, plus **`RapidOcrBackend` (`rapidocr` + `onnxruntime` using `ch_PP-OCRv5_det_mobile.onnx` + `cyrillic_PP-OCRv5_rec_mobile.onnx`) promoted & verified 100% in M1** behind a pluggable `OcrBackend` protocol (with optional timeout-guarded macOS Vision Swift helper, following the Phase 0 macOS `27.2` Vision `.accurate` hang discovery). |
+| **Tech Stack** | Pure Python (`pyproject.toml` + `.venv`, **Python `3.13`** via permanent uv-managed toolchain — verified arm64 wheels for all 17 deps since `onnxruntime` lacks Python `3.14` wheels): official `mcp` (`MCPServer`) SDK, `playwright`, `numpy`, `scipy`, `matplotlib`, `schemdraw`, `pypdfium2`, `pypdf`, `python-docx`, `pillow`, `starlette`, `uvicorn`, `pydantic`, plus **`RapidOcrBackend` (`rapidocr` + `onnxruntime` using `ch_PP-OCRv5_det_mobile.onnx` + `cyrillic_PP-OCRv5_rec_mobile.onnx`) promoted & verified 100% in M1** behind a pluggable `OcrBackend` protocol (with optional timeout-guarded macOS Vision Swift helper, following the Phase 0 macOS `27.2` Vision `.accurate` hang discovery). |
 | **Git & Legacy Migration** | Safely copy the existing workspace to `../PEA-legacy-backup/`, harvest reusable assets (Ruffle `0.7.1`, Noto Sans fonts, local SWFs) into gitignored `local_assets/`, initialize a clean **orphan `main` branch** (preserving `PLAN_V2.md`, `PHASE_0_PLAN.md`, and `PHASE_1_PLAN.md`) with a strict `.gitignore`. **Never force-push to `origin` without explicit user instruction.** |
 
 ---
@@ -28,7 +28,7 @@ This document is the single source of truth for rebuilding **PEA (Physics Experi
 flowchart LR
     Host["Host AI Agent (Claude / Antigravity / Cursor / Codex)"]
     Skill["Companion Skill (SKILL.md Workflow & Guardrails)"]
-    MCP["pea-mcp (FastMCP stdio Server)"]
+    MCP["pea-mcp (MCPServer stdio Server)"]
     Viewer["Local Viewer (Starlette on 127.0.0.1)"]
 
     subgraph Core["Deterministic Local Python Core (Zero LLM API Calls)"]
@@ -61,6 +61,7 @@ PEA/
 ├── PLAN_V2.md                        # Master blueprint & progress tracker (preserved across orphan init)
 ├── PHASE_0_PLAN.md                   # Day-0 non-destructive Ruffle probe plan & findings
 ├── PHASE_1_PLAN.md                   # Phase 1 clean-slate migration, .venv & core contracts runbook
+├── PHASE_2_PLAN.md                   # Phase 2 core subsystems (2A-2D) implementation runbook
 ├── pyproject.toml                    # Unified Python package, dependencies, pea-mcp & pea-viewer entry points
 ├── README.md                         # Setup, MCP client configs, architecture, zero-API-cost policy
 ├── scripts/
@@ -104,7 +105,7 @@ PEA/
 │   │   ├── __init__.py
 │   │   ├── app.py                    # Lightweight Starlette loopback viewer
 │   │   └── static/                   # Minimal clean dashboard UI
-│   └── mcp_server.py                 # FastMCP stdio server registering 16 universal tools + pea://policy
+│   └── mcp_server.py                 # MCPServer stdio server registering 16 universal tools + pea://policy
 ├── skills/
 │   └── pea-lab-assistant/
 │       └── SKILL.md                  # Universal workflow & guardrails for any connecting agent
@@ -150,19 +151,21 @@ PEA/
 - [x] **1.6** Implement `scripts/fetch_assets.py` (offline KaTeX CSS/JS/fonts into `local_assets/katex/` + pinned RapidOCR ONNX models `ch_PP-OCRv5_det_mobile.onnx` & `cyrillic_PP-OCRv5_rec_mobile.onnx` into `local_assets/ocr/`)
 - [x] **1.7** Implement `src/pea/config.py`, `src/pea/schemas.py` (all M1 + M2-ready Pydantic v2 contracts), and `src/pea/workspace.py` (run dirs, SHA-256 provenance ledger, atomic status writes)
 
+> Detailed execution steps for Phases 2A–2D live in [`PHASE_2_PLAN.md`](./PHASE_2_PLAN.md).
+
 ### Phase 2A — Pluggable OCR Engine (`RapidOCR` M1 Primary + Vision Guard) & Universal Simulator Engine
-- [ ] **2A.1** Implement `src/pea/ocr/base.py` (`OcrBackend` protocol) and `src/pea/ocr/rapid_ocr.py` (`RapidOcrBackend` via ONNX Runtime with `ch_PP-OCRv5_det_mobile` + `cyrillic_PP-OCRv5_rec_mobile`, `use_cls=False`, `intra_op_num_threads=4`, tight single-line `use_det=False` fast path + padded panel `det+rec`, and Cyrillic↔Latin homoglyph normalization for unit parsing)
-- [ ] **2A.2** Implement optional `native/macos_vision_ocr.swift` + `src/pea/ocr/macos_vision.py` (compiled with `-module-cache-path local_assets/swift-cache`, hard per-call timeout + automatic fallback to `RapidOcrBackend` so Vision `.accurate` hangs can never stall runs)
-- [ ] **2A.3** Implement `src/pea/sim/swf_meta.py` (CWS/FWS header parser -> exact native `(W, H)`, FPS, SHA-256)
-- [ ] **2A.4** Implement `src/pea/sim/runtime_server.py` (loopback `127.0.0.1` HTTP server, `Host` guard, auto-sized Ruffle player, `allowScriptAccess: false`, `allowNetworking: 'none'`)
-- [ ] **2A.5** Implement `src/pea/sim/profiles.py` (SHA-256 keyed `CalibrationProfile` persistence + live verification)
-- [ ] **2A.6** Implement `src/pea/sim/engine.py`:
-  - [ ] `sim_open` / `sim_close` (origin allowlist check, auto-detect saved profile)
-  - [ ] `sim_observe` (raw hashed PNG + optional annotated OCR coordinate overlay)
-  - [ ] `sim_act` (click, double-click, drag, type, OS-aware select-all, profile-declared `set_stepper` supporting `enter` and `step_interior` commit modes + inert focus-blur before capture to dismiss carets `|`)
-  - [ ] `sim_sweep` (high-speed N-point grid runner, homoglyph-normalized unit-aware OCR parser `мкТл`/`мТл`, optional sign `[-−]?\d+`, control match assertions, clean cancel with partial evidence)
-  - [ ] `sim_search_extremum` (`max`, `min`, wide-plateau `plateau_max` `[ω1, ω2]` detection handling plateaus ≥80 steps such as $R=5.0\,\Omega$'s 74-step plateau, `threshold`, full step trace + boundary screenshots)
-- [ ] **2A.7** Define clean M2 stubs in `src/pea/sim/protocols_m2.py` (`sim_watch`, `compute_sim`)
+- [x] **2A.1** Implement `src/pea/ocr/base.py` (`OcrBackend` protocol) and `src/pea/ocr/rapid_ocr.py` (`RapidOcrBackend` via ONNX Runtime with `ch_PP-OCRv5_det_mobile` + `cyrillic_PP-OCRv5_rec_mobile`, `use_cls=False`, `intra_op_num_threads=4`, tight single-line `use_det=False` fast path + padded panel `det+rec`, and Cyrillic↔Latin homoglyph normalization for unit parsing)
+- [x] **2A.2** Implement optional `native/macos_vision_ocr.swift` + `src/pea/ocr/macos_vision.py` (compiled with `-module-cache-path local_assets/swift-cache`, hard per-call timeout + automatic fallback to `RapidOcrBackend` so Vision `.accurate` hangs can never stall runs)
+- [x] **2A.3** Implement `src/pea/sim/swf_meta.py` (CWS/FWS header parser -> exact native `(W, H)`, FPS, SHA-256)
+- [x] **2A.4** Implement `src/pea/sim/runtime_server.py` (loopback `127.0.0.1` HTTP server, `Host` guard, auto-sized Ruffle player, `allowScriptAccess: false`, `allowNetworking: 'none'`)
+- [x] **2A.5** Implement `src/pea/sim/profiles.py` (SHA-256 keyed `CalibrationProfile` persistence + live verification)
+- [x] **2A.6** Implement `src/pea/sim/engine.py`:
+  - [x] `sim_open` / `sim_close` (origin allowlist check, auto-detect saved profile)
+  - [x] `sim_observe` (raw hashed PNG + optional annotated OCR coordinate overlay)
+  - [x] `sim_act` (click, double-click, drag, type, OS-aware select-all, profile-declared `set_stepper` supporting `enter` and `step_interior` commit modes + inert focus-blur before capture to dismiss carets `|`)
+  - [x] `sim_sweep` (high-speed N-point grid runner, homoglyph-normalized unit-aware OCR parser `мкТл`/`мТл`, optional sign `[-−]?\d+`, control match assertions, clean cancel with partial evidence)
+  - [x] `sim_search_extremum` (`max`, `min`, wide-plateau `plateau_max` `[ω1, ω2]` detection handling plateaus ≥80 steps such as $R=5.0\,\Omega$'s 74-step plateau, `threshold`, full step trace + boundary screenshots)
+- [x] **2A.7** Define clean M2 stubs in `src/pea/sim/protocols_m2.py` (`sim_watch`, `compute_sim`)
 
 ### Phase 2B — Physics Math, Data Analysis & Vector Visuals
 - [ ] **2B.1** Implement `src/pea/math_engine/calculator.py` (5-dim SI `[kg, m, s, A, K]`, mechanics + electrical/AC units, 3D vectors, complex impedance, immutable `calc_id` ledger, zero `eval`/`exec`)
@@ -178,7 +181,7 @@ PEA/
 - [ ] **2C.5** Implement `src/pea/report/evidence.py` (`evidence.zip` with raw screenshots, `provenance.jsonl`, OCR logs, CSV/JSON + optional multi-page `teacher-evidence.pdf`)
 
 ### Phase 2D — MCP Server, Local Viewer, Agent Skill & `.mcpb`
-- [ ] **2D.1** Implement `src/pea/mcp_server.py` (FastMCP stdio server registering all **16 universal tools** + `pea://policy` resource, Pydantic validation, path confinement)
+- [ ] **2D.1** Implement `src/pea/mcp_server.py` (`MCPServer` stdio server registering all **16 universal tools** + `pea://policy` resource, Pydantic validation, path confinement)
 - [ ] **2D.2** Implement `src/pea/viewer/app.py` + `static/` (Starlette loopback `127.0.0.1:5190`, `Host`/`Origin` guards, live capture feed, OCR box toggle, run history, downloads)
 - [ ] **2D.3** Author `skills/pea-lab-assistant/SKILL.md` (strict zero-fabrication, calibration, `calc_eval`/`data_analyze` math, visual PDF QA workflow)
 - [ ] **2D.4** Create `packaging/mcpb/manifest.json`, `packaging/mcpb/launcher.mjs`, `scripts/build_mcpb.py`, and `README.md`
@@ -214,3 +217,4 @@ PEA/
 | 2026-11-20 | Planning | Inspected legacy repo (`magnetic-field-lab`, `lab-runner`, `field-lab-mcp`, `swf-pilot`) and new Lab 5 attachments (`m96220.swf` + RLC PDF); completed `/grill-me` design decisions and created `PLAN_V2.md` & `PHASE_0_PLAN.md`. | Read-only SWF header check verified `m96220.swf` is `800×600 px`, 24 fps, Flex/Flacon SWF v9; no legacy files altered. |
 | 2026-11-20 | Phase 0 | Executed non-destructive Day-0 Ruffle `0.7.1` gate on `m96220.swf` and empirically verified the OCR mitigation in `/tmp/pea-phase0-probe/`. **Result: `GO WITH VERIFIED MITIGATION`.** Verified exact `800×600` stage, all controls/bounds/steps/commit modes, `Схема`/`Установка` modes, and all 4 Team 2 Lab 5 plateaus (`R=3.2 → [2445,2472]` midpoint `2458.5` vs `2458.70` `0.008%`; `R=4.0 → [2427,2444]`; `R=5.0 → [2361,2434]` 74-step plateau; `R=6.0 → [2333,2370]`). Confirmed macOS `27.2` Vision `.accurate` hangs across revisions `1–3` and `.fast` lacks `ru-RU` + drops `2444`. Benchmarked `RapidOCR` (`ch_PP-OCRv5_det_mobile` + `cyrillic_PP-OCRv5_rec_mobile` on permanent uv Python `3.13`, since `onnxruntime` lacks `3.14` wheels): **`50/50` (`100%`, `17.4 ms/ROI` rec-only) on Lab 5 sweep, `12/12` on R=4/5/6 boundaries, and `72/72` (`100%`) value+sign+unit match on legacy Lab 4 crops**. | Live Chromium `149.0.7827.55` + Ruffle `0.7.1` (`0` pageErrors, `0` console warn/err, `50` sweep + `12` R=4/5/6 + min/max/mode/commit/tall-container probes); isolated `/tmp/pea-phase0-probe/.venv-ocr` RapidOCR benchmark (`rapidocr==3.10.0`, `onnxruntime==1.32.0`); zero legacy repo files touched. |
 | 2026-11-21 | Phase 1 | Backed up legacy repo to `../PEA-legacy-backup/`, harvested Ruffle `0.7.1`, Noto Sans, RapidOCR ONNX models, local SWFs, and benchmark inputs into gitignored `local_assets/`, created clean orphan `main` branch (`12` tracked text files, zero binaries/home paths, no remote push), built Python `3.13.14` `.venv` with all 17 deps, implemented `scripts/fetch_assets.py` (`37` pinned offline files across `katex`, `ocr`, `ruffle`, `fonts`), and froze `config.py`, `schemas.py`, and `workspace.py`. | `32/32` tests pass in `tests/test_phase1_core.py`, `ruff check src/ tests/ scripts/` clean (`0` errors), `scripts/fetch_assets.py --check` passed offline (`37` files), `git rev-list --count HEAD == 1`. |
+| 2026-11-21 | Phase 2A | Implemented pluggable offline OCR (`src/pea/ocr/`: `OcrBackend`, `RapidOcrBackend` with explicit per-call `use_det` guard & homoglyph/unit parser, optional timeout-guarded `native/macos_vision_ocr.swift` + `MacOsVisionOcrBackend`) and universal simulator engine (`src/pea/sim/`: FWS/CWS/ZWS `swf_meta.py`, loopback `Host`-guarded `SimRuntimeServer`, SHA-256 atomic `ProfileStore`, `SimulatorSession`/`SimulatorManager` with boundary-safe `set_stepper`, `sweep`, wide-plateau `search_extremum`, cooperative cancellation, and M2 stubs `protocols_m2.py`). | `57/57` offline tests pass (`tests/test_phase1_core.py`, `test_swf_meta.py`, `test_ocr_and_profiles.py`, `test_sim_protocols.py`), `ruff check src/ tests/ scripts/` clean (`0` errors), Swift helper compiled cleanly via `-module-cache-path local_assets/swift-cache`, clean local commit on `main` (no remote push). |
