@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="{{LANG}}">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{DOC_TITLE}}</title>
+  <link rel="stylesheet" href="{{ASSET_PREFIX}}/katex/katex.min.css" />
+  <style>
+{{REPORT_CSS}}
+  </style>
+  <script src="{{ASSET_PREFIX}}/katex/katex.min.js"></script>
+  <script src="{{ASSET_PREFIX}}/katex/contrib/auto-render.min.js"></script>
+</head>
+<body>
+  <main class="document">
+    <header class="masthead">
+      {{MASTHEAD_HTML}}
+    </header>
+    {{BODY_HTML}}
+  </main>
+  <script>
+    (function () {
+      window.__katexDone = false;
+      window.__katexErrors = [];
+      async function finalize() {
+        try {
+          if (typeof renderMathInElement === "function") {
+            renderMathInElement(document.body, {
+              delimiters: [
+                { left: "$$", right: "$$", display: true },
+                { left: "\\[", right: "\\]", display: true },
+                { left: "$", right: "$", display: false },
+                { left: "\\(", right: "\\)", display: false }
+              ],
+              throwOnError: false,
+              strict: "ignore",
+              errorCallback: function (msg, err) {
+                window.__katexErrors.push(String(msg || err || "KaTeX error"));
+              }
+            });
+          } else {
+            window.__katexErrors.push("renderMathInElement not available");
+          }
+        } catch (err) {
+          window.__katexErrors.push(String(err));
+        }
+        try {
+          if (document.fonts && document.fonts.ready) {
+            await document.fonts.ready;
+          }
+        } catch (err) {
+          window.__katexErrors.push(String(err));
+        }
+        window.__katexDone = true;
+      }
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", finalize, { once: true });
+      } else {
+        finalize();
+      }
+    })();
+  </script>
+</body>
+</html>
