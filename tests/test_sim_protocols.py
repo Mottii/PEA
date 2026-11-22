@@ -1151,6 +1151,62 @@ async def test_session_edge_cases_retry_failure_cancel_and_control_type(tmp_path
     verify_shared = shared_ws.verify_provenance()
     assert verify_shared.ok is True, f"Multi-session provenance errors: {verify_shared.errors}"
 
+    # 7. Concurrent multi-session observe(annotate=True) + sweep() sharing one RunWorkspace
+    conc_wm = WorkspaceManager(tmp_path / "shared_conc" / "runs")
+    conc_ws = conc_wm.create_run(label="concurrent-session-prov", source="simulator_captured")
+    conc_cfg = PeaConfig(
+        project_root=tmp_path,
+        local_assets_dir=REPO_ROOT / "local_assets",
+        runs_dir=tmp_path / "shared_conc" / "runs",
+        profiles_dir=tmp_path / "shared_conc" / "profiles",
+    )
+    conc_ps = ProfileStore.from_config(conc_cfg)
+
+    async def _run_conc_worker(worker_idx: int) -> tuple[set[str], set[str], str]:
+        p_w = _MockSimPage(
+            initial_state={"R": 5.0, "omega": 2500.0 - worker_idx * 5.0},
+            profile=prof_fix,
+            readout_fn=_rlc_readout,
+        )
+        s_w = SimulatorSession(
+            session_id=f"sim-conc-{worker_idx}",
+            config=conc_cfg,
+            workspace=conc_ws,
+            ocr=_MockOcrBackend(p_w, prof_fix),
+            profile_store=conc_ps,
+            page=p_w,
+            target_url="http://127.0.0.1:9999/index.html",
+            loopback_origin="http://127.0.0.1:9999",
+            stage_width=prof_fix.stage_width,
+            stage_height=prof_fix.stage_height,
+            profile=prof_fix,
+            platform_name="darwin",
+        )
+        obs_w = await s_w.observe(annotate=True)
+        sw_w = await s_w.sweep(
+            SweepSpec(
+                axes=[SweepAxis(control="omega", values=[2500 - worker_idx, 2490 - worker_idx])],
+                readouts=["uc_over_u"],
+                settle_ms=0,
+            )
+        )
+        assert all("uc_over_u" in pt.readout_units for pt in sw_w["points"])
+        shots_w = {obs_w["screenshot_relpath"]} | {pt.screenshot_relpath for pt in sw_w["points"]}
+        anns_w = {obs_w["annotated_relpath"]}
+        return shots_w, anns_w, sw_w["readings_relpath"]
+
+    conc_results = await asyncio.gather(
+        _run_conc_worker(0), _run_conc_worker(1), _run_conc_worker(2)
+    )
+    all_conc_shots = set().union(*(r[0] for r in conc_results))
+    all_conc_anns = set().union(*(r[1] for r in conc_results))
+    all_conc_readings = {r[2] for r in conc_results}
+    assert len(all_conc_shots) == 9
+    assert len(all_conc_anns) == 3
+    assert len(all_conc_readings) == 3
+    verify_conc = conc_ws.verify_provenance()
+    assert verify_conc.ok is True, f"Concurrent provenance errors: {verify_conc.errors}"
+
 
 async def test_milestone2_protocol_stubs_raise_not_implemented() -> None:
     watch_spec = WatchSpec(readouts=["voltage_c"], duration_s=5.0, interval_ms=200)

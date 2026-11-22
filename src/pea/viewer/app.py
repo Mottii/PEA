@@ -275,6 +275,19 @@ def _load_ocr_for_screenshot(
     return [], None, {}
 
 
+def _resolve_confined_image(workspace: RunWorkspace, relpath: Any) -> str | None:
+    """Resolve *relpath* strictly inside *workspace* and verify it is an existing image file."""
+    if not isinstance(relpath, str):
+        return None
+    try:
+        resolved = workspace.resolve_path(relpath)
+    except PathConfinementError:
+        return None
+    if not resolved.is_file() or resolved.suffix.lower() not in _IMAGE_SUFFIXES:
+        return None
+    return resolved.relative_to(workspace.root).as_posix()
+
+
 def _find_annotated_for_screenshot(
     workspace: RunWorkspace,
     screenshot_relpath: str,
@@ -294,12 +307,9 @@ def _find_annotated_for_screenshot(
         candidates.append(f"crops/annotated-{suffix_match.group(1)}.png")
 
     for rel in candidates:
-        try:
-            resolved = workspace.resolve_path(rel)
-        except PathConfinementError:
-            continue
-        if resolved.is_file():
-            return resolved.relative_to(workspace.root).as_posix()
+        safe_rel = _resolve_confined_image(workspace, rel)
+        if safe_rel is not None:
+            return safe_rel
     return None
 
 
@@ -384,18 +394,9 @@ def _summarize_run(workspace: RunWorkspace) -> dict[str, Any]:
     entries = _read_provenance_lenient(workspace)
     downloads = _collect_downloads(workspace)
     shots = _list_screenshots(workspace)
-    latest_shot = status.metadata.get("latest_screenshot_relpath")
-    if isinstance(latest_shot, str):
-        try:
-            resolved_latest = workspace.resolve_path(latest_shot)
-            if resolved_latest.is_file():
-                latest_shot = resolved_latest.relative_to(workspace.root).as_posix()
-            else:
-                latest_shot = None
-        except PathConfinementError:
-            latest_shot = None
-    else:
-        latest_shot = None
+    latest_shot = _resolve_confined_image(
+        workspace, status.metadata.get("latest_screenshot_relpath")
+    )
     if latest_shot is None and shots:
         latest_shot = shots[0]
 
@@ -452,18 +453,9 @@ def _detail_run(workspace: RunWorkspace) -> dict[str, Any]:
                 )
 
     shots = _list_screenshots(workspace)
-    latest_shot = status.metadata.get("latest_screenshot_relpath")
-    if isinstance(latest_shot, str):
-        try:
-            resolved_latest = workspace.resolve_path(latest_shot)
-            if resolved_latest.is_file():
-                latest_shot = resolved_latest.relative_to(workspace.root).as_posix()
-            else:
-                latest_shot = None
-        except PathConfinementError:
-            latest_shot = None
-    else:
-        latest_shot = None
+    latest_shot = _resolve_confined_image(
+        workspace, status.metadata.get("latest_screenshot_relpath")
+    )
     if latest_shot is None and shots:
         latest_shot = shots[0]
 

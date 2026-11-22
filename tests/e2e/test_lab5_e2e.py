@@ -767,7 +767,7 @@ async def test_lab5_rlc_live_e2e_over_mcp_stdio(tmp_path: Path) -> None:
                                     "label": r"$\varepsilon_0 \cos\omega t$",
                                     "at": [0.0, 0.0],
                                     "to": [0.0, 3.0],
-                                    "style": {"label_loc": "left"},
+                                    "style": {"label_loc": "top"},
                                 },
                                 {
                                     "kind": "dot",
@@ -963,35 +963,60 @@ async def test_lab5_rlc_live_e2e_over_mcp_stdio(tmp_path: Path) -> None:
                                     "label": "$I_0$",
                                     "at": [0.0, 0.0],
                                     "to": [2.9, 0.0],
-                                    "style": {"color": "#2e7d32", "lw": 2.4},
+                                    "style": {
+                                        "color": "#2e7d32",
+                                        "lw": 2.4,
+                                        "label_offset": [0.22, 0.28],
+                                        "ha": "left",
+                                    },
                                 },
                                 {
                                     "kind": "phasor",
                                     "label": "$U_{0R}$",
                                     "at": [0.0, 0.0],
                                     "to": [2.0, 0.0],
-                                    "style": {"color": "#d97706", "lw": 2.4, "label_pos": "mid"},
+                                    "style": {
+                                        "color": "#d97706",
+                                        "lw": 2.4,
+                                        "label_pos": "mid",
+                                        "label_offset": [0.0, 0.34],
+                                    },
                                 },
                                 {
                                     "kind": "phasor",
                                     "label": "$U_{0L}$",
                                     "at": [0.0, 0.0],
                                     "to": [0.0, 2.2],
-                                    "style": {"color": "#1f4e79", "lw": 2.2},
+                                    "style": {
+                                        "color": "#1f4e79",
+                                        "lw": 2.2,
+                                        "label_offset": [0.36, 0.08],
+                                        "ha": "left",
+                                    },
                                 },
                                 {
                                     "kind": "phasor",
                                     "label": "$U_{0C}$",
                                     "at": [0.0, 0.0],
                                     "to": [0.0, -3.0],
-                                    "style": {"color": "#c0392b", "lw": 2.2},
+                                    "style": {
+                                        "color": "#c0392b",
+                                        "lw": 2.2,
+                                        "label_offset": [0.36, -0.08],
+                                        "ha": "left",
+                                    },
                                 },
                                 {
                                     "kind": "phasor",
                                     "label": r"$\varepsilon_0$",
                                     "at": [0.0, 0.0],
                                     "to": [2.0, -0.8],
-                                    "style": {"color": "#6b4c9a", "lw": 2.4},
+                                    "style": {
+                                        "color": "#6b4c9a",
+                                        "lw": 2.4,
+                                        "label_offset": [0.28, -0.18],
+                                        "ha": "left",
+                                    },
                                 },
                                 {
                                     "kind": "projection",
@@ -1098,18 +1123,22 @@ async def test_lab5_rlc_live_e2e_over_mcp_stdio(tmp_path: Path) -> None:
 
             row_by_r = {float(r["R_ohm"]): r for r in derived_rows}
             table2_rows = [
-                ["ω₁, 10³ rad/s"] + [f"{row_by_r[r]['w1'] / 1000.0:.3f}" for r in resistors],
-                ["ω₂, 10³ rad/s"] + [f"{row_by_r[r]['w2'] / 1000.0:.3f}" for r in resistors],
-                ["ω_res = (ω₁ + ω₂)/2, 10³ rad/s"]
+                [r"$\omega_1$, $10^3$ rad/s"]
+                + [f"{row_by_r[r]['w1'] / 1000.0:.3f}" for r in resistors],
+                [r"$\omega_2$, $10^3$ rad/s"]
+                + [f"{row_by_r[r]['w2'] / 1000.0:.3f}" for r in resistors],
+                [r"$\omega_{\text{res}} = (\omega_1 + \omega_2)/2$, $10^3$ rad/s"]
                 + [f"{row_by_r[r]['w_res'] / 1000.0:.4f}" for r in resistors],
-                ["ω_res,ideal, 10³ rad/s"]
+                [r"$\omega_{\text{res,ideal}}$, $10^3$ rad/s"]
                 + [f"{ideal_by_r[r]['w_res_ideal'] / 1000.0:.4f}" for r in resistors],
-                ["Δω = ω₀ − ω_res, 10³ rad/s"]
+                [r"$\Delta\omega = \omega_0 - \omega_{\text{res}}$, $10^3$ rad/s"]
                 + [f"{row_by_r[r]['dw'] / 1000.0:.4f}" for r in resistors],
-                ["ω₀ / Δω"] + [f"{row_by_r[r]['w0_over_dw']:.2f}" for r in resistors],
-                ["Q = U₀C / ε₀ (peak)"] + [f"{row_by_r[r]['Q_meas']:.2f}" for r in resistors],
-                ["Q²"] + [f"{row_by_r[r]['Q2']:.2f}" for r in resistors],
-                ["4 Q² (theory)"] + [f"{row_by_r[r]['four_Q2']:.2f}" for r in resistors],
+                [r"$\omega_0 / \Delta\omega$"]
+                + [f"{row_by_r[r]['w0_over_dw']:.2f}" for r in resistors],
+                [r"$Q = U_{0C} / \varepsilon_0$ (peak)"]
+                + [f"{row_by_r[r]['Q_meas']:.2f}" for r in resistors],
+                [r"$Q^2$"] + [f"{row_by_r[r]['Q2']:.2f}" for r in resistors],
+                [r"$4Q^2$ (theory)"] + [f"{row_by_r[r]['four_Q2']:.2f}" for r in resistors],
             ]
             table2 = {
                 "table_id": "lab5_table2",
@@ -1230,8 +1259,8 @@ async def test_lab5_rlc_live_e2e_over_mcp_stdio(tmp_path: Path) -> None:
                         "C = 32 µF matches the simulator readout exactly."
                     ),
                     (
-                        "Increasing resistance R lowers Q, broadens the discrete resonance "
-                        "plateau, and shifts ω_res further below ω₀."
+                        "Increasing resistance $R$ lowers $Q$, broadens the discrete resonance "
+                        "plateau, and shifts $\\omega_{\\text{res}}$ further below $\\omega_0$."
                     ),
                     (
                         f"Measured ω₀/Δω scales linearly with Q² "
@@ -1316,9 +1345,10 @@ async def test_lab5_rlc_live_e2e_over_mcp_stdio(tmp_path: Path) -> None:
                     {
                         "number": "36",
                         "question": (
-                            "Total Impedance of a Series RLC Circuit: Explain how R, X_L, and X_C "
-                            "combine, write the complex impedance and magnitude, illustrate the "
-                            "phasor diagram, discuss resonance, and give an RF tuning example."
+                            "Total Impedance of a Series RLC Circuit: Explain how $R$, $X_L$, "
+                            "and $X_C$ combine, write the complex impedance and magnitude, "
+                            "illustrate the phasor diagram, discuss resonance, and give an RF "
+                            "tuning example."
                         ),
                         "answer": (
                             "In steady-state AC, the inductive voltage leads current by $+\\pi/2$ "
@@ -1341,8 +1371,9 @@ async def test_lab5_rlc_live_e2e_over_mcp_stdio(tmp_path: Path) -> None:
                     {
                         "number": "3",
                         "prompt": (
-                            "The charge on a capacitor varies as q = 3×10⁻⁷ cos(800πt) C with "
-                            "L = 5 H. Find I(t), q_m, I_m, ω, and the maximum magnetic energy."
+                            "The charge on a capacitor varies as "
+                            "$q = 3\\times 10^{-7}\\cos(800\\pi t)$ C with $L = 5$ H. "
+                            "Find $I(t)$, $q_m$, $I_m$, $\\omega$, and the maximum magnetic energy."
                         ),
                         "solution": (
                             "Differentiating $q(t) = q_m \\cos(\\omega t)$ yields "
@@ -1360,9 +1391,10 @@ async def test_lab5_rlc_live_e2e_over_mcp_stdio(tmp_path: Path) -> None:
                     {
                         "number": "4",
                         "prompt": (
-                            "Given the tabulated free-oscillation charge q(t) with t in 10⁻⁶ s "
-                            "and q in 10⁻⁹ C: (A) write q(t) and find q_m, T, ω, f; (B) find W_m "
-                            "at t = 5 µs for C = 50 pF; (C) plot the q–I phase portrait."
+                            "Given the tabulated free-oscillation charge $q(t)$ with $t$ in "
+                            "$10^{-6}$ s and $q$ in $10^{-9}$ C: (A) write $q(t)$ and find "
+                            "$q_m$, $T$, $\\omega$, $f$; (B) find $W_m$ at $t = 5\\,\\mu\\text{s}$ "
+                            "for $C = 50$ pF; (C) plot the $q$–$I$ phase portrait."
                         ),
                         "solution": (
                             "(A) From the table, $q(0) = q_m = 2.0$ nC and $q(t)$ completes one "
@@ -1391,8 +1423,9 @@ async def test_lab5_rlc_live_e2e_over_mcp_stdio(tmp_path: Path) -> None:
                     {
                         "number": "5",
                         "prompt": (
-                            "An ideal LC circuit has C = 8 pF, L = 0.5 mH, and I_max = 40 mA. "
-                            "Determine the maximum voltage U_max across the capacitor plates."
+                            "An ideal LC circuit has $C = 8$ pF, $L = 0.5$ mH, and "
+                            "$I_{\\max} = 40$ mA. Determine the maximum voltage $U_{\\max}$ across "
+                            "the capacitor plates."
                         ),
                         "solution": (
                             "By energy conservation in an ideal LC circuit, "

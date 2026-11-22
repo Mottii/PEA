@@ -184,9 +184,9 @@ def _resolve_confined_input(
             seen.add(r)
             unique_roots.append(r)
 
+    norm_raw = raw_path.replace("\\", "/")
     first_confined: Path | None = None
-    if logical_prefixes and not Path(raw_path).is_absolute():
-        norm_raw = raw_path.replace("\\", "/")
+    if logical_prefixes and not Path(norm_raw).is_absolute():
         for prefix, mapped_root in logical_prefixes.items():
             prefix_slash = f"{prefix}/"
             if norm_raw.startswith(prefix_slash):
@@ -205,7 +205,7 @@ def _resolve_confined_input(
 
     for root in unique_roots:
         try:
-            candidate = resolve_confined_path(root, raw_path)
+            candidate = resolve_confined_path(root, norm_raw)
         except PathConfinementError:
             continue
         if first_confined is None:

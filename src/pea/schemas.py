@@ -347,6 +347,7 @@ class MeasurementPoint(StrictModel):
     parsed_value: float | int | str | None = None
     parsed_unit: str | None = None
     readouts: dict[str, float | int | str | None] = Field(default_factory=dict)
+    readout_units: dict[str, str | None] = Field(default_factory=dict)
     raw_readouts: dict[str, str] = Field(default_factory=dict)
     screenshot_relpath: str = Field(min_length=1)
     screenshot_sha256: str

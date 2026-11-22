@@ -244,6 +244,21 @@ def _update_bounds(bounds: list[float], x: float, y: float) -> None:
     bounds[3] = max(bounds[3], y)
 
 
+_TEXT_HALO: dict[str, Any] = {
+    "facecolor": "#ffffff",
+    "edgecolor": "none",
+    "alpha": 0.85,
+    "pad": 1.2,
+}
+
+
+def _resolve_label_offset(style: dict[str, Any], ctx: str) -> tuple[float, float] | None:
+    raw = style.get("label_offset")
+    if raw is None:
+        return None
+    return _validate_point(raw, f"{ctx}.style.label_offset")
+
+
 def _render_phasor(spec: DiagramSpec, fig: Figure) -> None:
     ax = fig.add_subplot(111)
     has_wave = any(el.kind.strip().lower() in ("wave", "sine", "cosine") for el in spec.elements)
@@ -282,12 +297,20 @@ def _render_phasor(spec: DiagramSpec, fig: Figure) -> None:
             if el.label:
                 dx, dy = x1 - x0, y1 - y0
                 norm = math.hypot(dx, dy) or 1.0
-                # Offset label slightly past tip or perpendicular to midpoint
-                if style.get("label_pos") == "mid":
-                    lx = 0.5 * (x0 + x1) - 0.16 * dy / norm
-                    ly = 0.5 * (y0 + y1) + 0.16 * dx / norm
+                # Offset label cleanly past tip or perpendicular to midpoint, with optional override
+                custom_off = _resolve_label_offset(style, f"elements[{idx}]")
+                if custom_off is not None:
+                    base_x, base_y = (
+                        (0.5 * (x0 + x1), 0.5 * (y0 + y1))
+                        if style.get("label_pos") == "mid"
+                        else (x1, y1)
+                    )
+                    lx, ly = base_x + custom_off[0], base_y + custom_off[1]
+                elif style.get("label_pos") == "mid":
+                    lx = 0.5 * (x0 + x1) - 0.22 * dy / norm
+                    ly = 0.5 * (y0 + y1) + 0.22 * dx / norm
                 else:
-                    offset = max(0.18, 0.08 * norm)
+                    offset = max(0.22, 0.09 * norm)
                     lx = x1 + offset * dx / norm
                     ly = y1 + offset * dy / norm
                 _track(lx, ly)
@@ -298,8 +321,9 @@ def _render_phasor(spec: DiagramSpec, fig: Figure) -> None:
                     color=color,
                     fontsize=9.5,
                     fontweight="bold",
-                    ha="center",
-                    va="center",
+                    ha=str(style.get("ha", "center")),
+                    va=str(style.get("va", "center")),
+                    bbox=_TEXT_HALO,
                     zorder=5,
                 )
 
@@ -502,7 +526,21 @@ def _render_field(spec: DiagramSpec, fig: Figure) -> None:
             if el.label:
                 dx, dy = x1 - x0, y1 - y0
                 norm = math.hypot(dx, dy) or 1.0
-                lx, ly = x1 + 0.1 * dx / norm, y1 + 0.1 * dy / norm
+                custom_off = _resolve_label_offset(style, f"elements[{idx}]")
+                if custom_off is not None:
+                    base_x, base_y = (
+                        (0.5 * (x0 + x1), 0.5 * (y0 + y1))
+                        if style.get("label_pos") == "mid"
+                        else (x1, y1)
+                    )
+                    lx, ly = base_x + custom_off[0], base_y + custom_off[1]
+                elif style.get("label_pos") == "mid":
+                    lx = 0.5 * (x0 + x1) - 0.24 * dy / norm
+                    ly = 0.5 * (y0 + y1) + 0.24 * dx / norm
+                else:
+                    offset = max(0.28, 0.14 * norm)
+                    lx = x1 + offset * dx / norm
+                    ly = y1 + offset * dy / norm
                 _track(lx, ly)
                 ax.text(
                     lx,
@@ -511,8 +549,9 @@ def _render_field(spec: DiagramSpec, fig: Figure) -> None:
                     color=color,
                     fontsize=9.5,
                     fontweight="bold",
-                    ha="center",
-                    va="center",
+                    ha=str(style.get("ha", "center")),
+                    va=str(style.get("va", "center")),
+                    bbox=_TEXT_HALO,
                     zorder=5,
                 )
 
@@ -683,14 +722,23 @@ def _render_field(spec: DiagramSpec, fig: Figure) -> None:
             if kind in ("point", "dot"):
                 ax.scatter([px], [py], color=color, s=36, zorder=5)
             if el.label:
+                custom_off = _resolve_label_offset(style, f"elements[{idx}]")
+                if custom_off is not None:
+                    lx, ly = px + custom_off[0], py + custom_off[1]
+                elif kind in ("point", "dot"):
+                    lx, ly = px + 0.10, py + 0.12
+                else:
+                    lx, ly = px, py
+                _track(lx, ly)
                 ax.text(
-                    px + 0.08,
-                    py + 0.08,
+                    lx,
+                    ly,
                     el.label,
                     color=color,
                     fontsize=9.2,
-                    ha="left",
-                    va="bottom",
+                    ha=str(style.get("ha", "left")),
+                    va=str(style.get("va", "bottom")),
+                    bbox=_TEXT_HALO,
                     zorder=6,
                 )
         else:

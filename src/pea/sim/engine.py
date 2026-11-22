@@ -498,17 +498,23 @@ class SimulatorSession:
         metadata: dict[str, Any] | None = None,
     ) -> tuple[Image.Image, str, str]:
         """Capture an unmodified raw PNG into ``evidence/`` and hash it in provenance."""
+        png_bytes = await self.page.screenshot(type="png")
+
+        # Atomically claim a unique sequence filename via O_CREAT|O_EXCL ('xb') after the
+        # screenshot await completes so concurrent sessions sharing a run_id never collide.
         while True:
             self._capture_seq += 1
             filename = f"{name_prefix}-{self._capture_seq:04d}.png"
             relpath = f"evidence/{filename}"
             abs_path = self.workspace.resolve_path(relpath)
-            if not abs_path.exists():
+            abs_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with abs_path.open("xb") as handle:
+                    handle.write(png_bytes)
                 break
-        abs_path.parent.mkdir(parents=True, exist_ok=True)
+            except FileExistsError:
+                continue
 
-        png_bytes = await self.page.screenshot(type="png")
-        abs_path.write_bytes(png_bytes)
         entry = self.workspace.record_artifact(
             relpath,
             kind="screenshot",
@@ -546,10 +552,22 @@ class SimulatorSession:
                 profile=self.profile,
                 font_path=overlay_font,
             )
-            annotated_relpath = f"crops/annotated-{self._capture_seq:04d}.png"
-            ann_path = self.workspace.resolve_path(annotated_relpath)
-            ann_path.parent.mkdir(parents=True, exist_ok=True)
-            overlay.save(ann_path, format="PNG")
+            png_buf = io.BytesIO()
+            overlay.save(png_buf, format="PNG")
+            ann_bytes = png_buf.getvalue()
+            seq_match = _SEQ_SUFFIX_RE.search(Path(relpath).name)
+            ann_seq = int(seq_match.group(1)) if seq_match is not None else self._capture_seq
+            while True:
+                candidate_rel = f"crops/annotated-{ann_seq:04d}.png"
+                ann_path = self.workspace.resolve_path(candidate_rel)
+                ann_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    with ann_path.open("xb") as handle:
+                        handle.write(ann_bytes)
+                    annotated_relpath = candidate_rel
+                    break
+                except FileExistsError:
+                    ann_seq += 1
             self.workspace.record_artifact(
                 annotated_relpath,
                 kind="annotated_overlay",
@@ -865,6 +883,7 @@ class SimulatorSession:
         )
 
         readouts_parsed: dict[str, float | int | str | None] = {}
+        readouts_units: dict[str, str | None] = {}
         readouts_raw: dict[str, str] = {}
         primary_unit: str | None = None
 
@@ -873,6 +892,7 @@ class SimulatorSession:
             ro_ocr, ro_val, ro_unit = self.ocr.read_spec(img, ro_spec)
             readouts_raw[ro_name] = join_ocr_text(ro_ocr)
             readouts_parsed[ro_name] = ro_val
+            readouts_units[ro_name] = ro_unit
             if ro_idx == 0:
                 primary_unit = ro_unit
 
@@ -903,6 +923,7 @@ class SimulatorSession:
             parsed_value=readouts_parsed[primary_name],
             parsed_unit=primary_unit,
             readouts=readouts_parsed,
+            readout_units=readouts_units,
             raw_readouts=readouts_raw,
             screenshot_relpath=relpath,
             screenshot_sha256=digest,
@@ -937,19 +958,23 @@ class SimulatorSession:
         if not record_provenance:
             return checkpoint_relpath
 
-        # Write a unique immutable snapshot under readings/ for SHA-256 provenance integrity
-        # so multi-sweep / multi-search runs never overwrite previously hashed files.
+        # Write a unique immutable snapshot under readings/ using O_CREAT|O_EXCL ('xb')
+        # so multi-session / multi-sweep runs never overwrite previously hashed files.
         readings_dir = self.workspace.resolve_path("readings")
         readings_dir.mkdir(parents=True, exist_ok=True)
         seq = _max_existing_seq(readings_dir)
         safe_kind = re.sub(r"[^A-Za-z0-9_.-]+", "_", kind).strip("_") or "readings"
+        encoded = (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
         while True:
             seq += 1
             snapshot_relpath = f"readings/{safe_kind}-{seq:04d}.json"
             snapshot_abs = self.workspace.resolve_path(snapshot_relpath)
-            if not snapshot_abs.exists():
+            try:
+                with snapshot_abs.open("xb") as handle:
+                    handle.write(encoded)
                 break
-        _atomic_write_json(snapshot_abs, payload)
+            except FileExistsError:
+                continue
         self.workspace.record_artifact(
             snapshot_relpath,
             kind="partial_readings",

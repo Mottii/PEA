@@ -87,6 +87,13 @@ def _to_microtesla(value: float, unit: str | None) -> float:
     return value
 
 
+def _fmt_signed_pct(value: float, decimals: int = 3) -> str:
+    """Format a signed percentage without emitting negative zero (``-0.000%``)."""
+    if abs(value) < 0.5 * (10.0 ** (-decimals)):
+        return f"{0.0:.{decimals}f}%"
+    return f"{value:+.{decimals}f}%"
+
+
 def _build_m96210_profile(swf_sha256: str) -> dict[str, Any]:
     """Calibration profile for ``m96210.swf`` (500x450 straight wire, 39 px top bar)."""
     return {
@@ -458,8 +465,11 @@ async def test_lab4_magnetic_field_live_e2e_over_mcp_stdio(tmp_path: Path) -> No
             for pt in l_sweep["points"]:
                 cur_a = int(round(float(pt["requested_settings"]["I"])))
                 dist_cm = int(round(float(pt["requested_settings"]["x"])))
-                bx_uT = _to_microtesla(float(pt["readouts"]["Bx"]), pt["parsed_unit"])
-                by_uT = float(pt["readouts"]["By"])
+                ro_units = pt.get("readout_units") or {}
+                bx_uT = _to_microtesla(
+                    float(pt["readouts"]["Bx"]), ro_units.get("Bx") or pt["parsed_unit"]
+                )
+                by_uT = _to_microtesla(float(pt["readouts"]["By"]), ro_units.get("By"))
                 exp_bx, exp_by, _exp_mag = ref_loop[(cur_a, dist_cm)]
                 assert bx_uT == pytest.approx(exp_bx, abs=1e-6), (
                     f"Loop Bx mismatch at I={cur_a} A, r={dist_cm} cm: "
@@ -762,7 +772,7 @@ async def test_lab4_magnetic_field_live_e2e_over_mcp_stdio(tmp_path: Path) -> No
                             "series": wire_series,
                             "annotations": [
                                 f"Mean μ₀ = {mean_wire_mu0 * 1e7:.4f} × 10⁻⁷ T·m/A",
-                                f"Deviation vs 4π×10⁻⁷: {mean_wire_dev:+.3f}%",
+                                f"Deviation vs 4π×10⁻⁷: {_fmt_signed_pct(mean_wire_dev)}",
                             ],
                         },
                     },
@@ -815,7 +825,7 @@ async def test_lab4_magnetic_field_live_e2e_over_mcp_stdio(tmp_path: Path) -> No
                             "series": loop_series,
                             "annotations": [
                                 f"Mean μ₀ = {mean_loop_mu0 * 1e7:.4f} × 10⁻⁷ T·m/A",
-                                f"Deviation vs 4π×10⁻⁷: {mean_loop_dev:+.3f}%",
+                                f"Deviation vs 4π×10⁻⁷: {_fmt_signed_pct(mean_loop_dev)}",
                             ],
                         },
                     },
@@ -845,8 +855,12 @@ async def test_lab4_magnetic_field_live_e2e_over_mcp_stdio(tmp_path: Path) -> No
                                 {
                                     "kind": "label",
                                     "label": "$I < 0$ (into page)",
-                                    "at": [-2.4, 0.22],
-                                    "style": {"color": "#c0392b"},
+                                    "at": [-2.8, 1.75],
+                                    "style": {
+                                        "color": "#c0392b",
+                                        "ha": "center",
+                                        "va": "bottom",
+                                    },
                                 },
                                 {
                                     "kind": "field_circle",
@@ -862,16 +876,28 @@ async def test_lab4_magnetic_field_live_e2e_over_mcp_stdio(tmp_path: Path) -> No
                                 {
                                     "kind": "vector",
                                     "label": "$r$",
-                                    "at": [-2.8, -0.32],
+                                    "at": [-2.8, -0.34],
                                     "to": [-2.8, -1.35],
-                                    "style": {"color": "#334155", "lw": 1.6},
+                                    "style": {
+                                        "color": "#334155",
+                                        "lw": 1.6,
+                                        "label_pos": "mid",
+                                        "label_offset": [0.28, 0.0],
+                                        "ha": "left",
+                                    },
                                 },
                                 {
                                     "kind": "vector",
                                     "label": r"$\vec{B}(r)$",
                                     "at": [-2.8, -1.35],
-                                    "to": [-4.1, -1.35],
-                                    "style": {"color": "#2e7d32", "lw": 2.2},
+                                    "to": [-4.25, -1.35],
+                                    "style": {
+                                        "color": "#2e7d32",
+                                        "lw": 2.2,
+                                        "label_offset": [0.0, -0.42],
+                                        "ha": "center",
+                                        "va": "top",
+                                    },
                                 },
                                 {
                                     "kind": "wire",
@@ -881,51 +907,71 @@ async def test_lab4_magnetic_field_live_e2e_over_mcp_stdio(tmp_path: Path) -> No
                                 },
                                 {
                                     "kind": "label",
-                                    "label": "Loop ($R = 3$ cm)",
-                                    "at": [0.55, 1.55],
-                                    "style": {"color": "#0f172a"},
-                                },
-                                {
-                                    "kind": "wire_out",
-                                    "at": [1.2, 1.25],
-                                    "length": 0.22,
-                                    "style": {"color": "#c0392b"},
+                                    "label": "Loop ($R = 3$ cm, $I < 0$)",
+                                    "at": [1.2, 1.75],
+                                    "style": {
+                                        "color": "#0f172a",
+                                        "ha": "center",
+                                        "va": "bottom",
+                                    },
                                 },
                                 {
                                     "kind": "wire_in",
-                                    "at": [1.2, -1.25],
-                                    "length": 0.22,
+                                    "at": [1.2, 1.25],
+                                    "length": 0.24,
                                     "style": {"color": "#c0392b"},
                                 },
                                 {
-                                    "kind": "field_line",
-                                    "at": [0.4, 0.0],
-                                    "to": [4.6, 0.0],
-                                    "style": {"color": "#64748b", "ls": "--"},
+                                    "kind": "wire_out",
+                                    "at": [1.2, -1.25],
+                                    "length": 0.24,
+                                    "style": {"color": "#c0392b"},
+                                },
+                                {
+                                    "kind": "line",
+                                    "at": [0.2, 0.0],
+                                    "to": [4.8, 0.0],
+                                    "style": {"color": "#64748b", "ls": "--", "lw": 1.3},
                                 },
                                 {
                                     "kind": "label",
                                     "label": "Axis $x = r$",
-                                    "at": [3.55, -0.45],
-                                    "style": {"color": "#64748b"},
+                                    "at": [4.75, -0.42],
+                                    "style": {
+                                        "color": "#64748b",
+                                        "ha": "right",
+                                        "va": "top",
+                                    },
                                 },
                                 {
                                     "kind": "vector",
                                     "label": r"$\vec{B}_x(r)$",
-                                    "at": [3.4, 0.0],
-                                    "to": [2.1, 0.0],
-                                    "style": {"color": "#1f4e79", "lw": 2.4},
+                                    "at": [3.55, 0.0],
+                                    "to": [2.05, 0.0],
+                                    "style": {
+                                        "color": "#1f4e79",
+                                        "lw": 2.4,
+                                        "label_pos": "mid",
+                                        "label_offset": [0.0, 0.42],
+                                        "ha": "center",
+                                        "va": "bottom",
+                                    },
                                 },
                                 {
                                     "kind": "point",
                                     "label": "$P(r, 0)$",
-                                    "at": [3.4, 0.0],
-                                    "style": {"color": "#d97706"},
+                                    "at": [3.55, 0.0],
+                                    "style": {
+                                        "color": "#d97706",
+                                        "label_offset": [0.18, 0.28],
+                                        "ha": "left",
+                                        "va": "bottom",
+                                    },
                                 },
                             ],
                             "notes": [
                                 "Left: straight wire B = μ₀|I|/(2πr)  |  "
-                                "Right: axial loop Bₓ = μ₀IR²/[2(R²+r²)³/²], Bᵧ = 0"
+                                "Right: axial loop (I < 0) Bₓ = μ₀IR²/[2(R²+r²)³/²], Bᵧ = 0"
                             ],
                         },
                     },
@@ -1009,7 +1055,7 @@ async def test_lab4_magnetic_field_live_e2e_over_mcp_stdio(tmp_path: Path) -> No
                         f"{row['slope'] * 1e6:.4f} µT·m",
                         f"{row['r_squared']:.6f}",
                         f"{row['mu0'] * 1e7:.4f}",
-                        f"{row['dev_pct']:+.3f}%",
+                        _fmt_signed_pct(row["dev_pct"]),
                     ]
                     for row in wire_mu0_rows
                 ]
@@ -1020,7 +1066,7 @@ async def test_lab4_magnetic_field_live_e2e_over_mcp_stdio(tmp_path: Path) -> No
                         f"{row['slope'] * 1e6:.5f} µT·m³",
                         f"{row['r_squared']:.6f}",
                         f"{row['mu0'] * 1e7:.4f}",
-                        f"{row['dev_pct']:+.3f}%",
+                        _fmt_signed_pct(row["dev_pct"]),
                     ]
                     for row in loop_mu0_rows
                 ],
@@ -1113,20 +1159,21 @@ async def test_lab4_magnetic_field_live_e2e_over_mcp_stdio(tmp_path: Path) -> No
                         "Zero-intercept linearized regressions achieved $R^2 > 0.9999$ for all "
                         "eight curves. Mean recovered permeability is "
                         f"$\\mu_{{0,\\text{{wire}}}} = {mean_wire_mu0 * 1e7:.4f} "
-                        f"\\times 10^{{-7}}$ T·m/A ({mean_wire_dev:+.3f}%) for the straight wire "
-                        f"and $\\mu_{{0,\\text{{loop}}}} = {mean_loop_mu0 * 1e7:.4f} "
-                        f"\\times 10^{{-7}}$ T·m/A ({mean_loop_dev:+.3f}%) for the circular loop, "
-                        "with every individual current curve within $< 0.5\\%$ of "
+                        f"\\times 10^{{-7}}$ T·m/A ({_fmt_signed_pct(mean_wire_dev)}) for the "
+                        f"straight wire and $\\mu_{{0,\\text{{loop}}}} = {mean_loop_mu0 * 1e7:.4f} "
+                        f"\\times 10^{{-7}}$ T·m/A ({_fmt_signed_pct(mean_loop_dev)}) for the "
+                        "circular loop, with every individual current curve within $< 0.5\\%$ of "
                         "$\\mu_0 = 4\\pi \\times 10^{-7}$ T·m/A."
                     ),
                     (
-                        "Scientific Honesty & Validation Status: All data in Tables 2 and 3 are "
-                        "tagged simulator_captured (virtual SWF readouts, not physical bench "
-                        "hall-probe measurements). The 72/72 agreement against "
-                        "lab4-measurements.json proves deterministic repeatability against the "
-                        "earlier automated Ruffle pilot; independent manual human reference "
-                        "verification (manualReference72Passed = False) and original Adobe Flash "
-                        "Player equivalence remain pending and are not claimed automatically."
+                        "Scientific Honesty & Validation Status: All data in Handout Tables 2 "
+                        "and 3 (Tables 1 and 2 above) are tagged simulator_captured (virtual SWF "
+                        "readouts, not physical bench hall-probe measurements). The 72/72 "
+                        "agreement against lab4-measurements.json proves deterministic "
+                        "repeatability against the earlier automated Ruffle pilot; independent "
+                        "manual human reference verification (manualReference72Passed = False) "
+                        "and original Adobe Flash Player equivalence remain pending and are not "
+                        "claimed automatically."
                     ),
                 ],
                 "conclusions": [
@@ -1141,8 +1188,9 @@ async def test_lab4_magnetic_field_live_e2e_over_mcp_stdio(tmp_path: Path) -> No
                     ),
                     (
                         "Linearized Biot–Savart regressions recover μ₀ within < 0.5% across "
-                        f"all 8 current/geometry series (wire mean {mean_wire_dev:+.3f}%, "
-                        f"loop mean {mean_loop_dev:+.3f}%)."
+                        "all 8 current/geometry series "
+                        f"(wire mean {_fmt_signed_pct(mean_wire_dev)}, "
+                        f"loop mean {_fmt_signed_pct(mean_loop_dev)})."
                     ),
                     (
                         "Independent manual reference review remains explicitly marked pending "

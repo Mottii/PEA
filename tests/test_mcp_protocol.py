@@ -711,17 +711,30 @@ async def test_mcp_sim_wrappers_ocr_handoff_and_lifespan_shutdown(tmp_path: Path
         with zipfile.ZipFile(ws.root / "reports/evidence.zip") as zf:
             assert any(name.endswith(f"{fake_sha}.json") for name in zf.namelist())
 
-        with pytest.raises(ToolError, match="Path confinement error"):
-            await server.call_tool(
-                "report_build",
-                {
-                    "run_id": ws.run_id,
-                    "formats": ["evidence_zip"],
-                    "render_previews": False,
-                    "profile_paths": ["profiles/../../secret.txt"],
-                    "spec": {"title": "Traversal Test", "language": "en"},
-                },
-            )
+        outside_secret = tmp_path / "outside_profile_secret.json"
+        outside_secret.write_text('{"secret": true}\n', encoding="utf-8")
+        symlink_escape = cfg.profiles_dir / "local" / "escape-link.json"
+        symlink_escape.parent.mkdir(parents=True, exist_ok=True)
+        symlink_escape.symlink_to(outside_secret)
+
+        for bad_prof_path in (
+            "profiles/../../secret.txt",
+            "profiles\\..\\..\\secret.txt",
+            "runs\\..\\..\\secret.txt",
+            "profiles//etc/passwd",
+            "profiles/local/escape-link.json",
+        ):
+            with pytest.raises(ToolError, match="Path confinement error"):
+                await server.call_tool(
+                    "report_build",
+                    {
+                        "run_id": ws.run_id,
+                        "formats": ["evidence_zip"],
+                        "render_previews": False,
+                        "profile_paths": [bad_prof_path],
+                        "spec": {"title": "Traversal Test", "language": "en"},
+                    },
+                )
 
         # sim_act
         acted = _parse_tool_json(
@@ -1041,8 +1054,14 @@ async def test_viewer_security_guards_host_origin_methods_and_traversal(tmp_path
             r = await client.get(bad_url)
             assert r.status_code == 403, f"Expected 403 for {bad_url}, got {r.status_code}"
 
-        # Escaping latest_screenshot_relpath in status.json must be confined in /api/runs too
-        for bad_rel in ("../../secret.txt", str(outside), "evidence/leak.txt"):
+        # Escaping or non-image latest_screenshot_relpath in status.json must be confined
+        for bad_rel in (
+            "../../secret.txt",
+            str(outside),
+            "evidence/leak.txt",
+            "status.json",
+            "provenance.jsonl",
+        ):
             ws.update_status(metadata_updates={"latest_screenshot_relpath": bad_rel})
             r_list = await client.get("/api/runs")
             assert r_list.status_code == 200

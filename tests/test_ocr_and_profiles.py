@@ -107,6 +107,9 @@ def test_normalize_homoglyphs_and_unit_parsing() -> None:
         ("B = 50,0", 50.0, None),
         ("B X = -67 ,86 мкТл", -67.86, "мкТл"),
         ("B = 142 .42 мкТл", 142.42, "мкТл"),
+        ("10\n.5", 10.0, None),
+        ("10    ,5", 10.0, None),
+        ("1, 2", 1.0, None),
     ]
     for raw_text, exp_val, exp_unit in labeled_cases:
         got_val, got_unit = parse_numeric_and_unit(raw_text, parse_mode="float")
