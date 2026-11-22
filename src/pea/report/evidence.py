@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 _EVIDENCE_SUBDIRS: tuple[str, ...] = (
     "evidence",
     "datasets",
+    "readings",
     "crops",
     "ocr",
     "profiles",

@@ -165,8 +165,14 @@ def _resolve_confined_input(
     allowed_roots: Sequence[Path],
     *,
     label: str,
+    logical_prefixes: dict[str, Path] | None = None,
 ) -> Path:
-    """Resolve *raw_path* strictly within one of *allowed_roots*, rejecting traversal/escapes."""
+    """Resolve *raw_path* strictly within one of *allowed_roots*, rejecting traversal/escapes.
+
+    When *logical_prefixes* is provided (e.g. ``{"profiles": cfg.profiles_dir}``), a
+    relative path prefixed with ``"<prefix>/"`` returned by ``_display_confined_path`` is
+    also resolved against the corresponding confined root if that root is in *allowed_roots*.
+    """
     if not raw_path or "\x00" in raw_path:
         raise PathConfinementError(f"Invalid {label}: {raw_path!r}")
 
@@ -179,6 +185,24 @@ def _resolve_confined_input(
             unique_roots.append(r)
 
     first_confined: Path | None = None
+    if logical_prefixes and not Path(raw_path).is_absolute():
+        norm_raw = raw_path.replace("\\", "/")
+        for prefix, mapped_root in logical_prefixes.items():
+            prefix_slash = f"{prefix}/"
+            if norm_raw.startswith(prefix_slash):
+                mapped_resolved = mapped_root.expanduser().resolve(strict=False)
+                if mapped_resolved in seen:
+                    sub = norm_raw[len(prefix_slash) :]
+                    if sub:
+                        try:
+                            candidate = resolve_confined_path(mapped_resolved, sub)
+                        except PathConfinementError:
+                            raise
+                        if first_confined is None:
+                            first_confined = candidate
+                        if candidate.exists():
+                            return candidate
+
     for root in unique_roots:
         try:
             candidate = resolve_confined_path(root, raw_path)
@@ -400,6 +424,12 @@ def create_mcp_server(
     # Group 1: Handout & Runs (2 tools)
     # ------------------------------------------------------------------
 
+    logical_roots: dict[str, Path] = {
+        "local_assets": cfg.local_assets_dir,
+        "runs": cfg.runs_dir,
+        "profiles": cfg.profiles_dir,
+    }
+
     @server.tool(
         name="lab_inspect_pdf",
         title="Inspect PDF Handout",
@@ -431,6 +461,7 @@ def create_mcp_server(
                 pdf_path,
                 (cfg.project_root, cfg.local_assets_dir, cfg.runs_dir),
                 label="pdf_path",
+                logical_prefixes=logical_roots,
             )
             if not resolved_pdf.is_file():
                 raise FileNotFoundError(f"PDF file not found: {resolved_pdf.name}")
@@ -575,12 +606,20 @@ def create_mcp_server(
             resolved_swf: Path | None = None
             resolved_html5: Path | None = None
             if swf_path is not None:
-                resolved_swf = _resolve_confined_input(swf_path, allowed_roots, label="swf_path")
+                resolved_swf = _resolve_confined_input(
+                    swf_path,
+                    allowed_roots,
+                    label="swf_path",
+                    logical_prefixes=logical_roots,
+                )
                 if not resolved_swf.is_file():
                     raise FileNotFoundError(f"SWF file not found: {resolved_swf.name}")
             elif html5_dir is not None:
                 resolved_html5 = _resolve_confined_input(
-                    html5_dir, allowed_roots, label="html5_dir"
+                    html5_dir,
+                    allowed_roots,
+                    label="html5_dir",
+                    logical_prefixes=logical_roots,
                 )
                 if not resolved_html5.is_dir():
                     raise FileNotFoundError(f"HTML5 directory not found: {resolved_html5.name}")
@@ -939,12 +978,14 @@ def create_mcp_server(
                         file_path,
                         (workspace.root, cfg.project_root, cfg.local_assets_dir, cfg.runs_dir),
                         label="file_path",
+                        logical_prefixes=logical_roots,
                     )
                 else:
                     resolved_file = _resolve_confined_input(
                         file_path,
                         (cfg.project_root, cfg.local_assets_dir, cfg.runs_dir),
                         label="file_path",
+                        logical_prefixes=logical_roots,
                     )
                     if not resolved_file.is_file():
                         raise FileNotFoundError(f"Dataset file not found: {resolved_file.name}")
@@ -1167,6 +1208,7 @@ def create_mcp_server(
                         p,
                         (cfg.profiles_dir, workspace.root, cfg.project_root),
                         label="profile_paths",
+                        logical_prefixes=logical_roots,
                     )
                     for p in profile_paths
                 ]

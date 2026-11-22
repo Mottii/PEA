@@ -385,8 +385,19 @@ def _summarize_run(workspace: RunWorkspace) -> dict[str, Any]:
     downloads = _collect_downloads(workspace)
     shots = _list_screenshots(workspace)
     latest_shot = status.metadata.get("latest_screenshot_relpath")
-    if not isinstance(latest_shot, str) or not (workspace.root / latest_shot).is_file():
-        latest_shot = shots[0] if shots else None
+    if isinstance(latest_shot, str):
+        try:
+            resolved_latest = workspace.resolve_path(latest_shot)
+            if resolved_latest.is_file():
+                latest_shot = resolved_latest.relative_to(workspace.root).as_posix()
+            else:
+                latest_shot = None
+        except PathConfinementError:
+            latest_shot = None
+    else:
+        latest_shot = None
+    if latest_shot is None and shots:
+        latest_shot = shots[0]
 
     return {
         "run_id": status.run_id,
@@ -445,7 +456,9 @@ def _detail_run(workspace: RunWorkspace) -> dict[str, Any]:
     if isinstance(latest_shot, str):
         try:
             resolved_latest = workspace.resolve_path(latest_shot)
-            if not resolved_latest.is_file():
+            if resolved_latest.is_file():
+                latest_shot = resolved_latest.relative_to(workspace.root).as_posix()
+            else:
                 latest_shot = None
         except PathConfinementError:
             latest_shot = None

@@ -688,6 +688,40 @@ async def test_mcp_sim_wrappers_ocr_handoff_and_lifespan_shutdown(tmp_path: Path
         )
         assert saved["verified_live"] is True
         assert _MACOS_HOME_MARKER not in saved["saved_relpath"]
+        assert saved["saved_relpath"].startswith("profiles/")
+
+        # Passing sim_save_profile's logical 'profiles/...' relpath into report_build works
+        # even when profiles_dir is separate from project_root, while traversal is blocked.
+        rep_with_prof = _parse_tool_json(
+            await server.call_tool(
+                "report_build",
+                {
+                    "run_id": ws.run_id,
+                    "formats": ["evidence_zip"],
+                    "render_previews": False,
+                    "profile_paths": [saved["saved_relpath"]],
+                    "spec": {
+                        "title": "Profile Logical Path Test",
+                        "language": "en",
+                    },
+                },
+            )
+        )
+        assert rep_with_prof["evidence_zip_relpath"] == "reports/evidence.zip"
+        with zipfile.ZipFile(ws.root / "reports/evidence.zip") as zf:
+            assert any(name.endswith(f"{fake_sha}.json") for name in zf.namelist())
+
+        with pytest.raises(ToolError, match="Path confinement error"):
+            await server.call_tool(
+                "report_build",
+                {
+                    "run_id": ws.run_id,
+                    "formats": ["evidence_zip"],
+                    "render_previews": False,
+                    "profile_paths": ["profiles/../../secret.txt"],
+                    "spec": {"title": "Traversal Test", "language": "en"},
+                },
+            )
 
         # sim_act
         acted = _parse_tool_json(
@@ -1006,6 +1040,20 @@ async def test_viewer_security_guards_host_origin_methods_and_traversal(tmp_path
         ):
             r = await client.get(bad_url)
             assert r.status_code == 403, f"Expected 403 for {bad_url}, got {r.status_code}"
+
+        # Escaping latest_screenshot_relpath in status.json must be confined in /api/runs too
+        for bad_rel in ("../../secret.txt", str(outside), "evidence/leak.txt"):
+            ws.update_status(metadata_updates={"latest_screenshot_relpath": bad_rel})
+            r_list = await client.get("/api/runs")
+            assert r_list.status_code == 200
+            summary = r_list.json()["runs"][0]
+            assert summary["latest_screenshot_relpath"] == "evidence/observe-0001.png"
+            r_det = await client.get(f"/api/runs/{run_id}")
+            assert r_det.status_code == 200
+            assert (
+                r_det.json()["latest_capture"]["screenshot_relpath"]
+                == "evidence/observe-0001.png"
+            )
 
     # CLI refuses non-loopback bind
     with pytest.raises(SystemExit) as exc_info:

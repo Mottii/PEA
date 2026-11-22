@@ -21,6 +21,7 @@ from pea.config import (
     PeaConfig,
     is_loopback_host,
     is_origin_allowed,
+    resolve_browser_executable,
     resolve_confined_path,
 )
 from pea.math_engine.calculator import load_calculations
@@ -1000,6 +1001,7 @@ async def render_html_to_pdf(
     from playwright.async_api import async_playwright
 
     cfg = config or PeaConfig.from_env()
+    browser_exec = cfg.browser_executable or resolve_browser_executable()
     strict_offline_cfg = PeaConfig(
         project_root=cfg.project_root,
         local_assets_dir=cfg.local_assets_dir,
@@ -1011,7 +1013,7 @@ async def render_html_to_pdf(
         ocr_backend=cfg.ocr_backend,
         ocr_threads=cfg.ocr_threads,
         ocr_timeout_s=cfg.ocr_timeout_s,
-        browser_executable=cfg.browser_executable,
+        browser_executable=browser_exec,
     )
 
     server = _OfflineRenderServer(
@@ -1036,8 +1038,8 @@ async def render_html_to_pdf(
     try:
         playwright = await async_playwright().start()
         launch_kwargs: dict[str, Any] = {"headless": True}
-        if cfg.browser_executable is not None:
-            launch_kwargs["executable_path"] = str(cfg.browser_executable)
+        if browser_exec is not None:
+            launch_kwargs["executable_path"] = str(browser_exec)
         browser = await playwright.chromium.launch(**launch_kwargs)
         context = await browser.new_context(
             viewport={"width": 1240, "height": 1754},

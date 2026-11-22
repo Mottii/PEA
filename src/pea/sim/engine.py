@@ -8,6 +8,7 @@ import itertools
 import json
 import math
 import os
+import re
 import secrets
 import sys
 from dataclasses import dataclass
@@ -17,9 +18,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
-from pea.config import PeaConfig, is_origin_allowed, normalize_origin
+from pea.config import PeaConfig, is_origin_allowed, normalize_origin, resolve_browser_executable
 from pea.ocr.base import OcrBackend, join_ocr_text
 from pea.schemas import (
     ActionStep,
@@ -41,6 +42,20 @@ from pea.sim.runtime_server import SimRuntimeServer
 from pea.workspace import RunWorkspace, WorkspaceManager
 
 _FLOAT_EPS = 1e-9
+_SEQ_SUFFIX_RE = re.compile(r"-(\d+)\.[^.]+$")
+
+
+def _max_existing_seq(*dirs: Path) -> int:
+    """Return the highest ``-NNNN.<ext>`` sequence number across *dirs* (0 if none)."""
+    highest = 0
+    for directory in dirs:
+        if not directory.is_dir():
+            continue
+        for item in directory.iterdir():
+            match = _SEQ_SUFFIX_RE.search(item.name)
+            if match is not None:
+                highest = max(highest, int(match.group(1)))
+    return highest
 
 
 class SimCancelledError(RuntimeError):
@@ -281,16 +296,31 @@ def values_match(
     return abs(req_num - obs_num) <= tol
 
 
+def _load_overlay_font(
+    font_path: Path | None,
+    size: int = 11,
+) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """Load bundled Noto Sans TTF for Cyrillic+Latin overlay tags with safe bitmap fallback."""
+    if font_path is not None and font_path.is_file():
+        try:
+            return ImageFont.truetype(str(font_path), size=size)
+        except OSError:
+            pass
+    return ImageFont.load_default()
+
+
 def render_annotated_overlay(
     image: Image.Image,
     ocr_result: OcrResult,
     *,
     grid_step: int = 100,
     profile: CalibrationProfile | None = None,
+    font_path: Path | None = None,
 ) -> Image.Image:
     """Draw a coordinate grid, numbered OCR boxes, and optional profile ROIs onto a copy."""
     canvas = image.convert("RGB").copy()
     draw = ImageDraw.Draw(canvas)
+    font = _load_overlay_font(font_path, size=11)
     width, height = canvas.size
 
     if grid_step > 0:
@@ -298,29 +328,29 @@ def render_annotated_overlay(
         label_color = (60, 80, 120)
         for x in range(0, width, grid_step):
             draw.line([(x, 0), (x, height)], fill=grid_color, width=1)
-            draw.text((x + 2, 2), str(x), fill=label_color)
+            draw.text((x + 2, 2), str(x), fill=label_color, font=font)
         for y in range(0, height, grid_step):
             draw.line([(0, y), (width, y)], fill=grid_color, width=1)
-            draw.text((2, y + 2), str(y), fill=label_color)
+            draw.text((2, y + 2), str(y), fill=label_color, font=font)
 
     for idx, box in enumerate(ocr_result.boxes):
         x1, y1, x2, y2 = box.bbox_px
         draw.rectangle([x1, y1, x2, y2], outline=(220, 38, 38), width=2)
         tag = f"[{idx}] {box.text}"
-        tag_y = max(0, y1 - 12)
-        draw.text((x1 + 1, tag_y), tag, fill=(185, 28, 28))
+        tag_y = max(0, y1 - 14)
+        draw.text((x1 + 1, tag_y), tag, fill=(185, 28, 28), font=font)
 
     if profile is not None:
         for name, readout in profile.readouts.items():
             x1, y1, x2, y2 = readout.roi_px
             draw.rectangle([x1, y1, x2, y2], outline=(22, 163, 74), width=2)
-            draw.text((x1 + 2, max(0, y1 - 12)), f"R:{name}", fill=(21, 128, 61))
+            draw.text((x1 + 2, max(0, y1 - 14)), f"R:{name}", fill=(21, 128, 61), font=font)
         for name, ctrl in profile.controls.items():
             pt = ctrl.input_xy or ctrl.click_xy
             if pt is not None:
                 cx, cy = pt
                 draw.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], outline=(37, 99, 235), width=2)
-                draw.text((cx + 6, max(0, cy - 6)), f"C:{name}", fill=(29, 78, 216))
+                draw.text((cx + 6, max(0, cy - 7)), f"C:{name}", fill=(29, 78, 216), font=font)
 
     return canvas
 
@@ -419,7 +449,11 @@ class SimulatorSession:
         self.page_errors: list[str] = []
         self.aborted_requests: list[str] = []
 
-        self._capture_seq = 0
+        self._capture_seq = _max_existing_seq(
+            self.workspace.evidence_dir,
+            self.workspace.crops_dir,
+            self.workspace.root / "ocr",
+        )
         self._cancel_event = asyncio.Event()
         self._closed = False
 
@@ -464,10 +498,13 @@ class SimulatorSession:
         metadata: dict[str, Any] | None = None,
     ) -> tuple[Image.Image, str, str]:
         """Capture an unmodified raw PNG into ``evidence/`` and hash it in provenance."""
-        self._capture_seq += 1
-        filename = f"{name_prefix}-{self._capture_seq:04d}.png"
-        relpath = f"evidence/{filename}"
-        abs_path = self.workspace.resolve_path(relpath)
+        while True:
+            self._capture_seq += 1
+            filename = f"{name_prefix}-{self._capture_seq:04d}.png"
+            relpath = f"evidence/{filename}"
+            abs_path = self.workspace.resolve_path(relpath)
+            if not abs_path.exists():
+                break
         abs_path.parent.mkdir(parents=True, exist_ok=True)
 
         png_bytes = await self.page.screenshot(type="png")
@@ -502,7 +539,13 @@ class SimulatorSession:
 
         annotated_relpath: str | None = None
         if annotate:
-            overlay = render_annotated_overlay(img, ocr_result, profile=self.profile)
+            overlay_font = self.config.local_assets_dir / "fonts" / "NotoSans-Regular.ttf"
+            overlay = render_annotated_overlay(
+                img,
+                ocr_result,
+                profile=self.profile,
+                font_path=overlay_font,
+            )
             annotated_relpath = f"crops/annotated-{self._capture_seq:04d}.png"
             ann_path = self.workspace.resolve_path(annotated_relpath)
             ann_path.parent.mkdir(parents=True, exist_ok=True)
@@ -877,7 +920,6 @@ class SimulatorSession:
         extra: dict[str, Any] | None = None,
         record_provenance: bool = False,
     ) -> str:
-        relpath = "partial-readings.json"
         payload: dict[str, Any] = {
             "kind": kind,
             "status": status,
@@ -887,16 +929,34 @@ class SimulatorSession:
         }
         if extra:
             payload.update(extra)
-        abs_path = self.workspace.resolve_path(relpath)
-        _atomic_write_json(abs_path, payload)
-        if record_provenance:
-            self.workspace.record_artifact(
-                relpath,
-                kind="partial_readings",
-                metadata={"status": status, "count": len(points), "operation": kind},
-                source="simulator_captured",
-            )
-        return relpath
+
+        # Always keep partial-readings.json updated as the mutable live checkpoint.
+        checkpoint_relpath = "partial-readings.json"
+        _atomic_write_json(self.workspace.resolve_path(checkpoint_relpath), payload)
+
+        if not record_provenance:
+            return checkpoint_relpath
+
+        # Write a unique immutable snapshot under readings/ for SHA-256 provenance integrity
+        # so multi-sweep / multi-search runs never overwrite previously hashed files.
+        readings_dir = self.workspace.resolve_path("readings")
+        readings_dir.mkdir(parents=True, exist_ok=True)
+        seq = _max_existing_seq(readings_dir)
+        safe_kind = re.sub(r"[^A-Za-z0-9_.-]+", "_", kind).strip("_") or "readings"
+        while True:
+            seq += 1
+            snapshot_relpath = f"readings/{safe_kind}-{seq:04d}.json"
+            snapshot_abs = self.workspace.resolve_path(snapshot_relpath)
+            if not snapshot_abs.exists():
+                break
+        _atomic_write_json(snapshot_abs, payload)
+        self.workspace.record_artifact(
+            snapshot_relpath,
+            kind="partial_readings",
+            metadata={"status": status, "count": len(points), "operation": kind},
+            source="simulator_captured",
+        )
+        return snapshot_relpath
 
     async def sweep(self, spec: SweepSpec) -> dict[str, Any]:
         """Run an N-dimensional parameter sweep with OCR verification & partial evidence."""
@@ -1440,8 +1500,9 @@ class SimulatorManager:
 
         self._playwright = await async_playwright().start()
         launch_kwargs: dict[str, Any] = {"headless": True}
-        if self.config.browser_executable is not None:
-            launch_kwargs["executable_path"] = str(self.config.browser_executable)
+        browser_exec = self.config.browser_executable or resolve_browser_executable()
+        if browser_exec is not None:
+            launch_kwargs["executable_path"] = str(browser_exec)
         self._browser = await self._playwright.chromium.launch(**launch_kwargs)
         return self._browser
 

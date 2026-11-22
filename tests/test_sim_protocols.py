@@ -1101,6 +1101,56 @@ async def test_session_edge_cases_retry_failure_cancel_and_control_type(tmp_path
     assert sess_cancel.workspace.read_status().phase == "cancelled"
     assert sess_cancel.workspace.verify_provenance().ok is True
 
+    # 6. Multi-session / multi-sweep provenance immutability in the same RunWorkspace
+    shared_wm = WorkspaceManager(tmp_path / "shared_multi" / "runs")
+    shared_ws = shared_wm.create_run(label="multi-session-prov", source="simulator_captured")
+    shared_cfg = PeaConfig(
+        project_root=tmp_path,
+        local_assets_dir=REPO_ROOT / "local_assets",
+        runs_dir=tmp_path / "shared_multi" / "runs",
+        profiles_dir=tmp_path / "shared_multi" / "profiles",
+    )
+    shared_ps = ProfileStore.from_config(shared_cfg)
+    shot_paths: set[str] = set()
+    reading_paths: set[str] = set()
+    for sess_idx in range(2):
+        p_multi = _MockSimPage(
+            initial_state={"R": 5.0, "omega": 2500.0},
+            profile=prof_fix,
+            readout_fn=_rlc_readout,
+        )
+        s_multi = SimulatorSession(
+            session_id=f"sim-multi-{sess_idx}",
+            config=shared_cfg,
+            workspace=shared_ws,
+            ocr=_MockOcrBackend(p_multi, prof_fix),
+            profile_store=shared_ps,
+            page=p_multi,
+            target_url="http://127.0.0.1:9999/index.html",
+            loopback_origin="http://127.0.0.1:9999",
+            stage_width=prof_fix.stage_width,
+            stage_height=prof_fix.stage_height,
+            profile=prof_fix,
+            platform_name="darwin",
+        )
+        obs_m = await s_multi.observe(annotate=True)
+        shot_paths.add(obs_m["screenshot_relpath"])
+        sw_m = await s_multi.sweep(
+            SweepSpec(
+                axes=[SweepAxis(control="omega", values=[2500, 2490])],
+                readouts=["uc_over_u"],
+                settle_ms=0,
+            )
+        )
+        reading_paths.add(sw_m["readings_relpath"])
+        for pt in sw_m["points"]:
+            shot_paths.add(pt.screenshot_relpath)
+    assert len(shot_paths) == 6
+    assert len(reading_paths) == 2
+    assert all(rp.startswith("readings/") for rp in reading_paths)
+    verify_shared = shared_ws.verify_provenance()
+    assert verify_shared.ok is True, f"Multi-session provenance errors: {verify_shared.errors}"
+
 
 async def test_milestone2_protocol_stubs_raise_not_implemented() -> None:
     watch_spec = WatchSpec(readouts=["voltage_c"], duration_s=5.0, interval_ms=200)

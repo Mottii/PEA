@@ -50,15 +50,16 @@ _DASH_REPLACEMENTS = str.maketrans(
     }
 )
 
-# Signed number (supports Russian decimal comma/dot and scientific notation with Latin/Cyrillic e).
+# Signed number (supports Russian decimal comma/dot, OCR box-split decimal separator
+# like '-67 ,86', and scientific notation with Latin/Cyrillic e).
 # Requires a non-identifier boundary before the number so trailing exponents like 'с-1'
 # or identifiers are not misparsed ahead of the primary reading.
 _NUMBER_RE = re.compile(
-    r"(?:(?<=^)|(?<=[\s=:(\[|]))([+-]?\s*\d+(?:[.,]\d+)?(?:[eEеЕ][+-]?\d+)?)"
+    r"(?:(?<=^)|(?<=[\s=:(\[|]))([+-]?\s*\d+(?:\s*[.,]\d+)?(?:[eEеЕ][+-]?\d+)?)"
 )
 
 # Fallback matcher when digits are glued to a prefix symbol without spaces (e.g. 'В=50,0').
-_LOOSE_NUMBER_RE = re.compile(r"([+-]?\d+(?:[.,]\d+)?(?:[eEеЕ][+-]?\d+)?)")
+_LOOSE_NUMBER_RE = re.compile(r"([+-]?\d+(?:\s*[.,]\d+)?(?:[eEеЕ][+-]?\d+)?)")
 
 # Unit-exponent suffixes (e.g. 'с-1', 'c-1', 's^-1', 'м^-3') masked before numeric parsing
 # so header/unit-only strings like 'f, с-1' do not falsely parse '-1' as a reading.
