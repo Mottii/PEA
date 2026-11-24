@@ -679,19 +679,32 @@ code,
   min-width: 140px;
 }
 
-.path-col a {
+.path-col a,
+.dataset-id-col a {
   color: var(--navy);
   text-decoration: none;
   font-weight: 600;
 }
 
-.path-col a:hover {
+.path-col a:hover,
+.dataset-id-col a:hover {
   text-decoration: underline;
+}
+
+.dataset-id-col {
+  overflow-wrap: anywhere;
+  min-width: 96px;
 }
 
 .sha-col {
   white-space: nowrap;
   color: var(--ink-muted);
+}
+
+.cols-col,
+.notes-col {
+  overflow-wrap: anywhere;
+  min-width: 140px;
 }
 
 .empty-state {

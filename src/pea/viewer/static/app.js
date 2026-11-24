@@ -49,6 +49,8 @@
     figuresCount: document.getElementById("figures-count"),
     figuresGrid: document.getElementById("figures-grid"),
     figuresEmpty: document.getElementById("figures-empty"),
+    datasetsCount: document.getElementById("datasets-count"),
+    datasetsTbody: document.getElementById("datasets-tbody"),
     provSummaryText: document.getElementById("provenance-summary-text"),
     provErrors: document.getElementById("provenance-errors"),
     provTbody: document.getElementById("provenance-tbody"),
@@ -401,6 +403,70 @@
     }
   }
 
+  function renderDatasets(datasets) {
+    const list = Array.isArray(datasets) ? datasets : [];
+    els.datasetsCount.textContent = `${list.length} ${list.length === 1 ? "dataset" : "datasets"}`;
+    clearChildren(els.datasetsTbody);
+
+    if (!list.length) {
+      const tr = document.createElement("tr");
+      const td = document.createElement("td");
+      td.colSpan = 5;
+      td.className = "empty-state";
+      td.textContent = "No datasets or model outputs recorded yet.";
+      tr.appendChild(td);
+      els.datasetsTbody.appendChild(tr);
+      return;
+    }
+
+    for (const ds of list) {
+      const tr = document.createElement("tr");
+
+      const tdId = document.createElement("td");
+      tdId.className = "mono dataset-id-col";
+      const link = document.createElement("a");
+      link.href = ds.url || "#";
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.textContent = ds.dataset_id || ds.relpath || "dataset";
+      tdId.appendChild(link);
+
+      const tdSource = document.createElement("td");
+      const pill = document.createElement("span");
+      const src = ds.source || "unspecified";
+      pill.className = sourcePillClass(src);
+      pill.textContent = src;
+      tdSource.appendChild(pill);
+
+      const tdRows = document.createElement("td");
+      tdRows.className = "num-col mono";
+      tdRows.textContent = String(typeof ds.row_count === "number" ? ds.row_count : 0);
+
+      const tdCols = document.createElement("td");
+      tdCols.className = "mono cols-col";
+      const cols = Array.isArray(ds.columns) ? ds.columns : [];
+      if (!cols.length) {
+        tdCols.textContent = "—";
+      } else if (cols.length > 6) {
+        tdCols.title = cols.join(", ");
+        tdCols.textContent = `${cols.slice(0, 6).join(", ")} (+${cols.length - 6} more)`;
+      } else {
+        tdCols.textContent = cols.join(", ");
+      }
+
+      const tdNotes = document.createElement("td");
+      tdNotes.className = "notes-col";
+      tdNotes.textContent = ds.notes ? String(ds.notes) : "—";
+
+      tr.appendChild(tdId);
+      tr.appendChild(tdSource);
+      tr.appendChild(tdRows);
+      tr.appendChild(tdCols);
+      tr.appendChild(tdNotes);
+      els.datasetsTbody.appendChild(tr);
+    }
+  }
+
   function renderProvenance(detail) {
     const ver = detail.provenance_verification || { ok: true, checked_entries: 0, errors: [] };
     const entries = Array.isArray(detail.provenance) ? detail.provenance : [];
@@ -519,6 +585,7 @@
     renderDownloads(detail.downloads || {});
     renderCapture(detail);
     renderFigures(detail.figures || []);
+    renderDatasets(detail.datasets || []);
     renderProvenance(detail);
   }
 

@@ -1,4 +1,4 @@
-"""Physics math & data analysis subsystem (dimensional AST calculator + OLS regression)."""
+"""Physics math & data analysis subsystem (calculator, OLS regression, compute_sim)."""
 
 from __future__ import annotations
 
@@ -30,6 +30,12 @@ from pea.math_engine.calculator import (
     load_calculations,
     parse_unit,
 )
+from pea.math_engine.compute_sim import (
+    ComputeSimError,
+    ComputeSimLimitError,
+    ComputeSimTimeoutError,
+    run_compute_sim,
+)
 
 __all__ = [
     "BUILTIN_CONSTANTS",
@@ -37,6 +43,9 @@ __all__ = [
     "UNIT_TABLE",
     "AnalysisError",
     "CalcError",
+    "ComputeSimError",
+    "ComputeSimLimitError",
+    "ComputeSimTimeoutError",
     "DimensionError",
     "Dims",
     "PhysicsCalculator",
@@ -55,5 +64,6 @@ __all__ = [
     "load_calculations",
     "load_dataset",
     "parse_unit",
+    "run_compute_sim",
     "run_ols_regression",
 ]

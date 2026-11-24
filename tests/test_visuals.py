@@ -192,6 +192,42 @@ class TestRenderPlot:
         assert blank_title_fig.caption == "fallback-caption"
         assert ws.verify_provenance().ok
 
+    def test_annotation_placement_avoids_legend_and_data(self, tmp_path: Path) -> None:
+        mgr = WorkspaceManager(tmp_path / "runs")
+        ws = mgr.create_run(label="ann-placement")
+
+        t_vals = [i * 0.1 for i in range(21)]
+        v_vals = [10.0 * math.exp(-t) for t in t_vals]
+        fig_rc = render_plot(
+            PlotSpec(
+                plot_id="rc-decay-ann",
+                title="RC Discharge",
+                x_label="Time t (s)",
+                y_label="Voltage Vc (V)",
+                series=[
+                    PlotSeries(
+                        label="sim_watch live OCR (simulator_captured)",
+                        x=t_vals,
+                        y=v_vals,
+                        kind="scatter",
+                    ),
+                    PlotSeries(
+                        label="compute_sim RK45 ODE (model_computed)",
+                        x=t_vals,
+                        y=v_vals,
+                        kind="line",
+                    ),
+                ],
+                annotations=["OLS tau = 1.000 s (ref 1.000 s, R^2 = 1.0000)"],
+            ),
+            ws,
+        )
+        _assert_valid_svg_and_png(
+            ws.resolve_path(fig_rc.svg_relpath or ""),
+            ws.resolve_path(fig_rc.png_relpath or ""),
+        )
+        assert ws.verify_provenance().ok
+
 
 class TestRenderDiagram:
     def test_schemdraw_lab5_rlc_circuit(self, tmp_path: Path) -> None:

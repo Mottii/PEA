@@ -1,19 +1,23 @@
-"""Offline protocol, security, viewer, and packaging tests for Phase 2D.
+"""Offline protocol, security, viewer, and packaging tests for PEA v2.
 
 Exercises:
-1. Real ``mcp.client.stdio.stdio_client`` against ``pea-mcp`` (all 16 universal tools,
-   ToolAnnotations, ``pea://policy``, ``calc_eval``, ``data_ingest``/``data_analyze``,
-   ``plot_render``, ``diagram_render``, ``lab_inspect_pdf``, ``report_build``,
-   ``report_preview``, startup crash recovery, extra-field & path-traversal rejection).
-2. Mocked simulator MCP tool wrappers + lifespan ``close_all()`` cleanup.
+1. Real ``mcp.client.stdio.stdio_client`` against ``pea-mcp`` (all 18 universal tools,
+   ToolAnnotations, ``pea://policy``, ``calc_eval``, ``compute_sim``,
+   ``data_ingest``/``data_analyze``, ``plot_render``, ``diagram_render``,
+   ``lab_inspect_pdf``, ``report_build``, ``report_preview``, startup crash recovery,
+   extra-field & path-traversal rejection).
+2. Mocked simulator MCP tool wrappers (including ``sim_open`` ``sim_sha256`` & ``sim_watch``)
+   + lifespan ``close_all()`` cleanup.
 3. Starlette ``pea-viewer`` anti-DNS-rebinding ``Host``/``Origin`` guards, CSP/nosniff
-   headers, artifact confinement, OCR overlay JSON payload, and CLI loopback guard.
+   headers, artifact confinement, enriched Datasets & Model Outputs metadata/UI,
+   OCR overlay JSON payload, and CLI loopback guard.
 4. Claude Desktop ``.mcpb`` deterministic builder, negative security audits, and live
    Node.js ``launcher.mjs`` stdio handshake.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib.util
 import io
@@ -39,7 +43,12 @@ from PIL import Image
 
 from pea import __version__
 from pea.config import PeaConfig, resolve_browser_executable
-from pea.mcp_server import POLICY_URI, UNIVERSAL_TOOL_NAMES, create_mcp_server
+from pea.mcp_server import (
+    POLICY_URI,
+    UNIVERSAL_TOOL_NAMES,
+    _collect_run_artifacts,
+    create_mcp_server,
+)
 from pea.schemas import (
     CalibrationProfile,
     ControlSpec,
@@ -47,7 +56,7 @@ from pea.schemas import (
     OcrResult,
     ReadoutSpec,
 )
-from pea.sim.engine import SimulatorManager, SimulatorSession
+from pea.sim.engine import SimCancelledError, SimulatorManager, SimulatorSession
 from pea.sim.profiles import ProfileStore
 from pea.viewer.app import create_viewer_app
 from pea.viewer.app import main as viewer_main
@@ -146,11 +155,11 @@ async def test_mcp_stdio_tools_policy_math_analysis_and_visuals(tmp_path: Path) 
             assert init.server_info.name == "pea-mcp"
             assert init.server_info.version == __version__
 
-            # Verify all 16 universal tools + annotations + strict additionalProperties=False
+            # Verify all 18 universal tools + annotations + strict additionalProperties=False
             tools_res = await session.list_tools()
             tool_names = tuple(t.name for t in tools_res.tools)
             assert tool_names == UNIVERSAL_TOOL_NAMES
-            assert len(tools_res.tools) == 16
+            assert len(tools_res.tools) == 18
 
             forbidden_tool_names = {
                 "shell",
@@ -185,7 +194,7 @@ async def test_mcp_stdio_tools_policy_math_analysis_and_visuals(tmp_path: Path) 
             policy = json.loads(policy_text)
             assert policy["zero_api_cost"] is True
             assert policy["llm_api_calls"] == 0
-            assert policy["tools_count"] == 16
+            assert policy["tools_count"] == 18
             assert policy["security"]["loopback_only_default"] is True
             assert policy["security"]["arbitrary_shell_tools"] is False
             assert policy["security"]["strict_schemas_extra_forbid"] is True
@@ -274,6 +283,97 @@ async def test_mcp_stdio_tools_policy_math_analysis_and_visuals(tmp_path: Path) 
             assert analyze_out["regressions"][0]["slope"] == pytest.approx(2.0, rel=1e-9)
             assert analyze_out["regressions"][0]["r_squared"] == pytest.approx(1.0, rel=1e-9)
             assert analyze_out["comparisons"][0]["percent_deviation"] == pytest.approx(0.0)
+
+            # End-to-end compute_sim (ode_ivp + dataset-backed fft_spectrum)
+            ode_out = _parse_tool_json(
+                await session.call_tool(
+                    "compute_sim",
+                    {
+                        "run_id": run_id,
+                        "spec": {
+                            "model_kind": "ode_ivp",
+                            "expressions": ["v", "-4 * pi**2 * f0**2 * x"],
+                            "state_variables": ["x", "v"],
+                            "parameters": {"f0": 2.0},
+                            "grid_variable": "t",
+                            "grid_start": 0.0,
+                            "grid_stop": 2.0,
+                            "grid_points": 64,
+                            "initial_state": [1.0, 0.0],
+                            "dataset_id": "osc_ode",
+                            "notes": "Harmonic oscillator ODE",
+                        },
+                    },
+                )
+            )
+            assert ode_out["run_id"] == run_id
+            assert ode_out["provenance"] == "model_computed"
+            assert ode_out["dataset_id"] == "osc_ode"
+            assert ode_out["dataset_relpath"] == "datasets/osc_ode.json"
+            assert ode_out["row_count"] == 64
+            assert len(ode_out["preview_rows"]) == 10
+
+            fft_out = _parse_tool_json(
+                await session.call_tool(
+                    "compute_sim",
+                    {
+                        "run_id": run_id,
+                        "spec": {
+                            "model_kind": "fft_spectrum",
+                            "input_dataset_id": "osc_ode",
+                            "time_column": "t",
+                            "signal_column": "x",
+                            "window": "hann",
+                            "detrend_mean": True,
+                            "dataset_id": "osc_fft",
+                        },
+                    },
+                )
+            )
+            assert fft_out["provenance"] == "model_computed"
+            assert fft_out["dataset_id"] == "osc_fft"
+            assert fft_out["solver_meta"]["dominant_frequency_hz"] == pytest.approx(2.0, abs=0.35)
+
+            # Missing run_id with input_dataset_id must fail cleanly without creating an orphan run
+            runs_before_err = len(list(runs_dir.iterdir()))
+            bad_fft = await session.call_tool(
+                "compute_sim",
+                {
+                    "spec": {
+                        "model_kind": "fft_spectrum",
+                        "input_dataset_id": "osc_ode",
+                        "time_column": "t",
+                        "signal_column": "x",
+                    }
+                },
+            )
+            assert bad_fft.is_error is True
+            assert len(list(runs_dir.iterdir())) == runs_before_err
+
+            # Concurrent compute_sim on shared run_id with omitted dataset_id allocates unique IDs
+            conc_grid = {
+                "model_kind": "algebraic_grid",
+                "expression": "cos(t)",
+                "grid_start": 0.0,
+                "grid_stop": 1.0,
+                "grid_points": 8,
+            }
+            conc_results = await asyncio.gather(
+                session.call_tool("compute_sim", {"run_id": run_id, "spec": conc_grid}),
+                session.call_tool("compute_sim", {"run_id": run_id, "spec": conc_grid}),
+                session.call_tool("compute_sim", {"run_id": run_id, "spec": conc_grid}),
+            )
+            conc_ids = [_parse_tool_json(r)["dataset_id"] for r in conc_results]
+            assert len(set(conc_ids)) == 3
+
+            # Concurrent compute_sim with run_id=None creates distinct runs with no collisions
+            conc_new = await asyncio.gather(
+                session.call_tool("compute_sim", {"spec": conc_grid}),
+                session.call_tool("compute_sim", {"spec": conc_grid}),
+            )
+            new_run_ids = [_parse_tool_json(r)["run_id"] for r in conc_new]
+            assert len(set(new_run_ids)) == 2
+            assert run_id not in new_run_ids
 
             # End-to-end plot_render & diagram_render
             plot_out = _parse_tool_json(
@@ -428,6 +528,22 @@ async def test_mcp_stdio_rejects_extra_fields_traversal_and_unsafe_inputs(tmp_pa
                 "lab_runs", {"action": "get", "run_id": "../project"}
             )
             assert res_bad_run.is_error is True
+
+            # 7. Unsafe compute_sim AST with run_id=None rejected with zero orphan runs created
+            res_unsafe_compute = await session.call_tool(
+                "compute_sim",
+                {
+                    "spec": {
+                        "model_kind": "algebraic_grid",
+                        "expression": "__import__('os').system('id')",
+                        "grid_variable": "t",
+                        "grid_start": 0.0,
+                        "grid_stop": 1.0,
+                        "grid_points": 5,
+                    }
+                },
+            )
+            assert res_unsafe_compute.is_error is True
 
             assert len(list(runs_dir.iterdir())) == runs_before
 
@@ -603,7 +719,9 @@ class _FakeOcr:
 
 
 @pytest.mark.asyncio
-async def test_mcp_sim_wrappers_ocr_handoff_and_lifespan_shutdown(tmp_path: Path) -> None:
+async def test_mcp_sim_wrappers_ocr_handoff_and_lifespan_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     cfg = PeaConfig(
         project_root=tmp_path,
         local_assets_dir=LOCAL_ASSETS_DIR,
@@ -631,13 +749,28 @@ async def test_mcp_sim_wrappers_ocr_handoff_and_lifespan_shutdown(tmp_path: Path
         stage_width=400,
         stage_height=300,
         header_height_px=39,
+        sim_sha256=fake_sha,
     )
     sim_mgr._sessions[session.session_id] = session
+
+    async def _mock_open(**_kwargs: Any) -> SimulatorSession:
+        return session
+
+    sim_mgr.open = _mock_open  # type: ignore[method-assign]
+    html5_stub = tmp_path / "html5_stub"
+    html5_stub.mkdir()
+    (html5_stub / "index.html").write_text("<html></html>", encoding="utf-8")
 
     server = create_mcp_server(cfg, workspace_manager=wm, sim_manager=sim_mgr)
 
     # Exercise lifespan enter + tool calls + lifespan exit closing active sessions
     async with server._lowlevel_server.lifespan(server._lowlevel_server):
+        opened = _parse_tool_json(
+            await server.call_tool("sim_open", {"html5_dir": "html5_stub"})
+        )
+        assert opened["session_id"] == "sim-mock01"
+        assert opened["sim_sha256"] == fake_sha
+
         obs = _parse_tool_json(
             await server.call_tool(
                 "sim_observe",
@@ -790,6 +923,74 @@ async def test_mcp_sim_wrappers_ocr_handoff_and_lifespan_shutdown(tmp_path: Path
         assert found["high_bound"] == pytest.approx(14.0)
         assert found["midpoint"] == pytest.approx(13.0)
 
+        # sim_watch (burst_post_ocr + dataset export + latest_screenshot_relpath update)
+        watched = _parse_tool_json(
+            await server.call_tool(
+                "sim_watch",
+                {
+                    "session_id": "sim-mock01",
+                    "spec": {
+                        "readouts": ["amp"],
+                        "duration_s": 0.05,
+                        "interval_ms": 20,
+                        "max_frames": 3,
+                        "save_dataset": True,
+                        "dataset_id": "watch_mock",
+                    },
+                },
+            )
+        )
+        assert watched["session_id"] == "sim-mock01"
+        assert watched["run_id"] == ws.run_id
+        assert watched["pacing_mode"] == "burst_post_ocr"
+        assert watched["status"] in ("complete", "max_frames_reached")
+        assert watched["captured_frames"] >= 1
+        assert watched["dataset_id"] == "watch_mock"
+        assert watched["dataset_relpath"] == "datasets/watch_mock.json"
+        assert (
+            ws.read_status().metadata["latest_screenshot_relpath"]
+            == watched["points"][-1]["screenshot_relpath"]
+        )
+
+        # sim_watch rejects unknown readout with sanitized ToolError
+        with pytest.raises(ToolError, match="Readout 'missing_ro'"):
+            await server.call_tool(
+                "sim_watch",
+                {
+                    "session_id": "sim-mock01",
+                    "spec": {
+                        "readouts": ["missing_ro"],
+                        "duration_s": 0.05,
+                        "interval_ms": 20,
+                    },
+                },
+            )
+
+        # sim_watch translates SimCancelledError cleanly with partial-point summary
+        orig_watch = session.watch
+
+        async def _cancelled_watch(_spec: Any) -> Any:
+            raise SimCancelledError(
+                "cancelled mid-transient",
+                partial_trace=[],
+                readings_relpath="readings/watch-cancel.json",
+            )
+
+        monkeypatch.setattr(session, "watch", _cancelled_watch)
+        with pytest.raises(ToolError, match="Operation cancelled.*watch-cancel.json"):
+            await server.call_tool(
+                "sim_watch",
+                {
+                    "session_id": "sim-mock01",
+                    "spec": {
+                        "readouts": ["amp"],
+                        "duration_s": 0.05,
+                        "interval_ms": 20,
+                    },
+                },
+            )
+        monkeypatch.setattr(session, "watch", orig_watch)
+
         # Verify unknown session raises clean ToolError
         with pytest.raises(ToolError, match="Unknown simulator session_id"):
             await server.call_tool("sim_observe", {"session_id": "sim-missing"})
@@ -877,6 +1078,47 @@ def _seed_viewer_run(cfg: PeaConfig) -> tuple[WorkspaceManager, str]:
     )
     (ws.resolve_path("reports/partial.tmp")).write_text("temp", encoding="utf-8")
 
+    # Seed both simulator_captured and model_computed datasets (plus a hidden dotfile ignored)
+    sim_ds = ws.resolve_path("datasets/rc_watch.json")
+    sim_ds.parent.mkdir(parents=True, exist_ok=True)
+    sim_ds.write_text(
+        json.dumps(
+            {
+                "dataset_id": "rc_watch",
+                "source": "simulator_captured",
+                "rows": [
+                    {"elapsed_s": 0.0, "Vc": 10.0},
+                    {"elapsed_s": 1.0, "Vc": 3.68},
+                ],
+                "units": {"elapsed_s": "s", "Vc": "V"},
+                "notes": "Live RC discharge watch",
+            }
+        ),
+        encoding="utf-8",
+    )
+    ws.record_artifact("datasets/rc_watch.json", kind="dataset", source="simulator_captured")
+
+    model_ds = ws.resolve_path("datasets/rc_ode.json")
+    model_ds.write_text(
+        json.dumps(
+            {
+                "dataset_id": "rc_ode",
+                "source": "model_computed",
+                "rows": [
+                    {"t": 0.0, "Vc": 10.0, "c3": 1, "c4": 2, "c5": 3, "c6": 4, "c7": 5},
+                    {"t": 1.0, "Vc": 3.679, "c3": 1, "c4": 2, "c5": 3, "c6": 4, "c7": 5},
+                    {"t": 2.0, "Vc": 1.353, "c3": 1, "c4": 2, "c5": 3, "c6": 4, "c7": 5},
+                ],
+                "units": {"t": "s", "Vc": "V"},
+                "notes": "RK45 RC discharge model",
+            }
+        ),
+        encoding="utf-8",
+    )
+    ws.record_artifact("datasets/rc_ode.json", kind="dataset", source="model_computed")
+
+    (ws.root / "datasets" / ".hidden_staging.json").write_text("{}", encoding="utf-8")
+
     ws.update_status(
         metadata_updates={
             "latest_screenshot_relpath": "evidence/observe-0001.png",
@@ -944,6 +1186,18 @@ async def test_viewer_endpoints_headers_and_ocr_payload(tmp_path: Path) -> None:
         assert detail["latest_capture"]["ocr_boxes"][0]["text"] == "2458.5"
         assert detail["downloads"]["pdf_url"] == f"/runs/{run_id}/reports/report.pdf"
 
+        # Enriched datasets metadata (skipping hidden dotfiles)
+        ds_by_id = {d["dataset_id"]: d for d in detail["datasets"]}
+        assert set(ds_by_id.keys()) == {"rc_watch", "rc_ode"}
+        assert ds_by_id["rc_watch"]["source"] == "simulator_captured"
+        assert ds_by_id["rc_watch"]["row_count"] == 2
+        assert ds_by_id["rc_watch"]["columns"] == ["elapsed_s", "Vc"]
+        assert ds_by_id["rc_watch"]["notes"] == "Live RC discharge watch"
+        assert ds_by_id["rc_watch"]["url"] == f"/runs/{run_id}/datasets/rc_watch.json"
+        assert ds_by_id["rc_ode"]["source"] == "model_computed"
+        assert ds_by_id["rc_ode"]["row_count"] == 3
+        assert ds_by_id["rc_ode"]["columns"] == ["t", "Vc", "c3", "c4", "c5", "c6", "c7"]
+
         # Artifact streaming + safe headers
         r_png = await client.get(f"/runs/{run_id}/evidence/observe-0001.png")
         assert r_png.status_code == 200
@@ -988,10 +1242,14 @@ async def test_viewer_security_guards_host_origin_methods_and_traversal(tmp_path
     wm, run_id = _seed_viewer_run(cfg)
     ws = wm.get_run(run_id)
 
-    # Plant an outside secret and an escaping symlink inside the run
+    # Plant an outside secret and an escaping symlink inside the run (including datasets/)
     outside = tmp_path / "secret.txt"
     outside.write_text("top-secret", encoding="utf-8")
+    outside_json = tmp_path / "outside_dataset.json"
+    outside_json.write_text('{"dataset_id": "leaked", "rows": [{"secret": 1}]}', encoding="utf-8")
     (ws.root / "evidence" / "leak.txt").symlink_to(outside)
+    (ws.root / "datasets" / "leak_ds.json").symlink_to(outside_json)
+    (ws.root / "datasets" / "corrupt_ds.json").write_text("{not valid json", encoding="utf-8")
 
     app = create_viewer_app(cfg, workspace_manager=wm)
     transport = httpx.ASGITransport(app=app)
@@ -1049,10 +1307,61 @@ async def test_viewer_security_guards_host_origin_methods_and_traversal(tmp_path
             f"/runs/{run_id}/..%2F..%2Fsecret.txt",
             f"/runs/{run_id}/%2e%2e/%2e%2e/secret.txt",
             f"/runs/{run_id}/evidence/leak.txt",
+            f"/runs/{run_id}/datasets/leak_ds.json",
             "/static/..%2Fapp.py",
         ):
             r = await client.get(bad_url)
             assert r.status_code == 403, f"Expected 403 for {bad_url}, got {r.status_code}"
+
+        # Escaping symlink in datasets/ is skipped, and malformed/non-dict JSON degrades gracefully
+        (ws.root / "datasets" / "list_ds.json").write_text("[1, 2, 3]", encoding="utf-8")
+        (ws.root / "datasets" / "bad_src.json").write_text(
+            json.dumps({"dataset_id": "bad_src", "source": "bogus_origin", "rows": [{"x": 1}]}),
+            encoding="utf-8",
+        )
+        r_ds_check = await client.get(f"/api/runs/{run_id}")
+        assert r_ds_check.status_code == 200
+        ds_entries = {d["dataset_id"]: d for d in r_ds_check.json()["datasets"]}
+        assert "leak_ds" not in ds_entries
+        assert "leaked" not in ds_entries
+        assert "corrupt_ds" in ds_entries
+        assert ds_entries["corrupt_ds"]["row_count"] == 0
+        assert ds_entries["corrupt_ds"]["columns"] == []
+        assert ds_entries["list_ds"]["row_count"] == 0
+        assert ds_entries["bad_src"]["source"] == "unspecified"
+
+        # Hidden dotfiles must never be served directly by /runs/{run_id}/{artifact}
+        r_dot = await client.get(f"/runs/{run_id}/datasets/.hidden_staging.json")
+        assert r_dot.status_code == 404
+
+        # Dataset metadata cache invalidates immediately when a file changes on disk
+        updated_ds_path = ws.root / "datasets" / "bad_src.json"
+        updated_ds_path.write_text(
+            json.dumps(
+                {
+                    "dataset_id": "bad_src",
+                    "source": "bench_manual",
+                    "rows": [{"x": 1}, {"x": 2}],
+                    "notes": "Updated note",
+                }
+            ),
+            encoding="utf-8",
+        )
+        r_ds_updated = await client.get(f"/api/runs/{run_id}")
+        assert r_ds_updated.status_code == 200
+        ds_updated = {d["dataset_id"]: d for d in r_ds_updated.json()["datasets"]}
+        assert ds_updated["bad_src"]["source"] == "bench_manual"
+        assert ds_updated["bad_src"]["row_count"] == 2
+        assert ds_updated["bad_src"]["notes"] == "Updated note"
+
+        # _collect_run_artifacts also excludes escaping symlinks across datasets/figures/reports
+        (ws.root / "figures" / "leak_fig.png").symlink_to(outside)
+        (ws.root / "reports" / "leak_rep.pdf").symlink_to(outside)
+        collected = _collect_run_artifacts(ws)
+        assert "datasets/leak_ds.json" not in collected["datasets"]
+        assert "figures/leak_fig.png" not in collected["figures"]
+        assert "reports/leak_rep.pdf" not in collected["reports"]
+        assert "datasets/.hidden_staging.json" not in collected["datasets"]
 
         # Escaping or non-image latest_screenshot_relpath in status.json must be confined
         for bad_rel in (
@@ -1152,11 +1461,20 @@ async def test_viewer_responsive_desktop_and_mobile_zero_overflow_and_ocr_toggle
                             iw: window.innerWidth,
                             rects: document.querySelectorAll('.ocr-rect').length,
                             badge: document.getElementById('detail-provenance-badge').textContent,
+                            dsCount: document.getElementById('datasets-count').textContent,
+                            dsRows: document.querySelectorAll('#datasets-tbody tr').length,
+                            dsText: document.getElementById('datasets-tbody').textContent,
                         })"""
                     )
                     assert metrics["sw"] <= metrics["iw"], f"Horizontal overflow at {vp}: {metrics}"
                     assert metrics["rects"] == 1
                     assert "SHA-256 Verified" in metrics["badge"]
+                    assert metrics["dsCount"] == "2 datasets"
+                    assert metrics["dsRows"] == 2
+                    assert "simulator_captured" in metrics["dsText"]
+                    assert "model_computed" in metrics["dsText"]
+                    assert "rc_watch" in metrics["dsText"]
+                    assert "rc_ode" in metrics["dsText"]
 
                     # Toggle OCR boxes off & annotated PNG on
                     await page.click("#toggle-ocr")

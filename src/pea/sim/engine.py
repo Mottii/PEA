@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import itertools
 import json
@@ -11,6 +12,8 @@ import os
 import re
 import secrets
 import sys
+import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -20,13 +23,21 @@ from urllib.parse import urlsplit
 
 from PIL import Image, ImageDraw, ImageFont
 
-from pea.config import PeaConfig, is_origin_allowed, normalize_origin, resolve_browser_executable
+from pea.config import (
+    PeaConfig,
+    is_origin_allowed,
+    normalize_origin,
+    resolve_browser_executable,
+    resolve_confined_path,
+)
+from pea.math_engine.analysis import data_ingest
 from pea.ocr.base import OcrBackend, join_ocr_text
 from pea.schemas import (
     ActionStep,
     CalibrationProfile,
     CommitMode,
     ControlSpec,
+    DatasetSpec,
     MeasurementPoint,
     OcrMode,
     OcrResult,
@@ -36,6 +47,10 @@ from pea.schemas import (
     SearchSpec,
     SweepSpec,
     SwfMeta,
+    WatchPacingMode,
+    WatchResult,
+    WatchSpec,
+    WatchStatus,
 )
 from pea.sim.profiles import ProfileStore, validate_profile_geometry
 from pea.sim.runtime_server import SimRuntimeServer
@@ -43,6 +58,16 @@ from pea.workspace import RunWorkspace, WorkspaceManager
 
 _FLOAT_EPS = 1e-9
 _SEQ_SUFFIX_RE = re.compile(r"-(\d+)\.[^.]+$")
+_WATCH_DATASET_RE = re.compile(r"^watch-(\d+)\.json$")
+_WATCH_RESERVED_COLUMNS: frozenset[str] = frozenset(
+    {
+        "index",
+        "elapsed_s",
+        "frame_timestamp_ms",
+        "screenshot_relpath",
+        "screenshot_sha256",
+    }
+)
 
 
 def _max_existing_seq(*dirs: Path) -> int:
@@ -405,6 +430,174 @@ def _is_route_url_allowed(
     return is_origin_allowed(target, loopback_origin, config)
 
 
+def compute_html5_dir_sha256(root_dir: str | Path) -> str:
+    """Compute a deterministic SHA-256 fingerprint of all confined files under *root_dir*."""
+    root = Path(root_dir).expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        raise FileNotFoundError(f"HTML5 simulator directory not found: {root}")
+
+    entries: list[tuple[str, Path]] = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames.sort()
+        filenames.sort()
+        dir_path = Path(dirpath)
+        for dirname in dirnames:
+            sub_path = dir_path / dirname
+            if sub_path.is_symlink():
+                rel_dir = sub_path.relative_to(root).as_posix()
+                resolve_confined_path(root, rel_dir)
+        for filename in filenames:
+            rel_posix = (dir_path / filename).relative_to(root).as_posix()
+            resolved = resolve_confined_path(root, rel_posix)
+            if not resolved.is_file():
+                raise FileNotFoundError(
+                    f"HTML5 simulator entry is not a readable regular file: {rel_posix}"
+                )
+            entries.append((rel_posix, resolved))
+
+    if not entries:
+        raise ValueError(f"HTML5 simulator directory contains no files: {root}")
+
+    entries.sort(key=lambda item: item[0])
+    hasher = hashlib.sha256()
+    hasher.update(b"pea-html5-dir-v1\x00")
+    for rel_posix, resolved in entries:
+        rel_bytes = rel_posix.encode("utf-8")
+        file_bytes = resolved.read_bytes()
+        hasher.update(f"{len(rel_bytes)}:".encode("ascii"))
+        hasher.update(rel_bytes)
+        hasher.update(b"\x00")
+        hasher.update(f"{len(file_bytes)}:".encode("ascii"))
+        hasher.update(file_bytes)
+        hasher.update(b"\x00")
+    return hasher.hexdigest()
+
+
+def compute_url_sha256(url: str) -> str:
+    """Compute a deterministic SHA-256 fingerprint of a canonicalized HTTP(S) simulator URL."""
+    text = url.strip()
+    if not text or any(ch.isspace() for ch in text):
+        raise ValueError(f"Invalid simulator URL: {url!r}")
+
+    parsed = urlsplit(text)
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported simulator URL scheme in {url!r}; only http/https allowed")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(f"Credentials/userinfo are forbidden in simulator URL: {url!r}")
+    if not parsed.hostname:
+        raise ValueError(f"Missing hostname in simulator URL: {url!r}")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"Invalid port in simulator URL: {url!r}") from exc
+
+    host = parsed.hostname.lower()
+    host_fmt = f"[{host}]" if ":" in host else host
+    default_port = 80 if scheme == "http" else 443
+    netloc = host_fmt if (port is None or port == default_port) else f"{host_fmt}:{port}"
+    path = parsed.path or "/"
+    canonical = f"{scheme}://{netloc}{path}"
+    if parsed.query:
+        canonical = f"{canonical}?{parsed.query}"
+
+    return hashlib.sha256(b"pea-url-v1\x00" + canonical.encode("utf-8")).hexdigest()
+
+
+def _as_finite_float(value: Any) -> float | None:
+    """Convert *value* to a finite float, rejecting booleans, None, and non-numeric text."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        fval = float(value)
+        return fval if math.isfinite(fval) else None
+    if isinstance(value, str):
+        cleaned = value.strip().replace(",", ".")
+        if not cleaned:
+            return None
+        try:
+            fval = float(cleaned)
+        except ValueError:
+            return None
+        return fval if math.isfinite(fval) else None
+    return None
+
+
+def _check_threshold(point: MeasurementPoint, spec: WatchSpec) -> bool:
+    """Evaluate an optional numeric threshold early-stop predicate against *point*."""
+    if spec.stop_readout is None or spec.stop_op is None or spec.stop_value is None:
+        return False
+    val = _as_finite_float(point.readouts.get(spec.stop_readout))
+    if val is None:
+        return False
+    target = spec.stop_value
+    if spec.stop_op == "le":
+        return val <= target
+    if spec.stop_op == "lt":
+        return val < target
+    if spec.stop_op == "ge":
+        return val >= target
+    if spec.stop_op == "gt":
+        return val > target
+    return False
+
+
+class _StabilityTracker:
+    """Tracks consecutive finite readout stability windows with strict OCR-miss resets."""
+
+    def __init__(
+        self,
+        *,
+        readouts: list[str],
+        stop_when_stable_s: float,
+        stability_tol: float,
+    ) -> None:
+        self._readouts = list(readouts)
+        self._stop_when_stable_s = stop_when_stable_s
+        self._stability_tol = stability_tol
+        self.anchor_values: dict[str, float] | None = None
+        self.anchor_elapsed_s: float | None = None
+        self.valid_count: int = 0
+
+    def reset(self) -> None:
+        self.anchor_values = None
+        self.anchor_elapsed_s = None
+        self.valid_count = 0
+
+    def update(self, point: MeasurementPoint) -> bool:
+        current: dict[str, float] = {}
+        for ro_name in self._readouts:
+            fval = _as_finite_float(point.readouts.get(ro_name))
+            if fval is None:
+                self.reset()
+                return False
+            current[ro_name] = fval
+
+        elapsed = point.elapsed_s
+        if elapsed is None or not math.isfinite(elapsed):
+            self.reset()
+            return False
+
+        if self.anchor_values is None or self.anchor_elapsed_s is None:
+            self.anchor_values = current
+            self.anchor_elapsed_s = elapsed
+            self.valid_count = 1
+            return False
+
+        tol = self._stability_tol + _FLOAT_EPS
+        if all(abs(current[ro] - self.anchor_values[ro]) <= tol for ro in self._readouts):
+            self.valid_count += 1
+            return (
+                self.valid_count >= 2
+                and (elapsed - self.anchor_elapsed_s) >= self._stop_when_stable_s - _FLOAT_EPS
+            )
+
+        self.anchor_values = current
+        self.anchor_elapsed_s = elapsed
+        self.valid_count = 1
+        return False
+
+
 class SimulatorSession:
     """Live or mock-backed simulator session with provenance logging, sweeps, and search."""
 
@@ -424,6 +617,7 @@ class SimulatorSession:
         header_height_px: int = 39,
         server: SimRuntimeServer | None = None,
         swf_meta: SwfMeta | None = None,
+        sim_sha256: str | None = None,
         profile: CalibrationProfile | None = None,
         context: Any = None,
         platform_name: str | None = None,
@@ -441,6 +635,11 @@ class SimulatorSession:
         self.header_height_px = header_height_px
         self.server = server
         self.swf_meta = swf_meta
+        self.sim_sha256: str | None = (
+            sim_sha256
+            if sim_sha256 is not None
+            else (swf_meta.sha256 if swf_meta is not None else None)
+        )
         self.profile = profile
         self._context = context
         self._platform_name = platform_name
@@ -491,15 +690,14 @@ class SimulatorSession:
         await self.page.mouse.click(target[0], target[1])
         return target
 
-    async def capture_frame(
+    def _write_and_record_frame(
         self,
-        name_prefix: str = "frame",
+        png_bytes: bytes,
         *,
+        name_prefix: str = "frame",
         metadata: dict[str, Any] | None = None,
     ) -> tuple[Image.Image, str, str]:
-        """Capture an unmodified raw PNG into ``evidence/`` and hash it in provenance."""
-        png_bytes = await self.page.screenshot(type="png")
-
+        """Atomically persist raw PNG bytes under ``evidence/`` and record SHA-256 provenance."""
         # Atomically claim a unique sequence filename via O_CREAT|O_EXCL ('xb') after the
         # screenshot await completes so concurrent sessions sharing a run_id never collide.
         while True:
@@ -524,6 +722,20 @@ class SimulatorSession:
         with Image.open(io.BytesIO(png_bytes)) as opened:
             pil_img = opened.convert("RGB")
         return (pil_img, entry.relpath, entry.sha256)
+
+    async def capture_frame(
+        self,
+        name_prefix: str = "frame",
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[Image.Image, str, str]:
+        """Capture an unmodified raw PNG into ``evidence/`` and hash it in provenance."""
+        png_bytes = await self.page.screenshot(type="png")
+        return self._write_and_record_frame(
+            png_bytes,
+            name_prefix=name_prefix,
+            metadata=metadata,
+        )
 
     async def observe(
         self,
@@ -737,10 +949,15 @@ class SimulatorSession:
         shared: bool = False,
     ) -> dict[str, Any]:
         """Validate geometry and live control/readout visibility before persisting a profile."""
-        if self.swf_meta is not None and profile.swf_sha256 != self.swf_meta.sha256:
+        expected_sha = (
+            self.sim_sha256
+            if self.sim_sha256 is not None
+            else (self.swf_meta.sha256 if self.swf_meta is not None else None)
+        )
+        if expected_sha is not None and profile.swf_sha256 != expected_sha:
             raise ValueError(
-                f"Profile swf_sha256={profile.swf_sha256} does not match loaded SWF "
-                f"{self.swf_meta.sha256}"
+                f"Profile swf_sha256={profile.swf_sha256} does not match loaded simulator "
+                f"{expected_sha}"
             )
         validate_profile_geometry(
             profile,
@@ -1475,6 +1692,586 @@ class SimulatorSession:
             )
             raise
 
+    async def _sleep_ms_cancellable(self, ms: int) -> bool:
+        """Sleep *ms* milliseconds via ``_sleep_ms``, waking immediately on ``request_cancel()``."""
+        if self._cancel_event.is_set():
+            return True
+        if ms <= 0:
+            return False
+        sleep_task = asyncio.create_task(self._sleep_ms(ms))
+        cancel_task = asyncio.create_task(self._cancel_event.wait())
+        try:
+            done, pending = await asyncio.wait(
+                {sleep_task, cancel_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            if sleep_task in done and not sleep_task.cancelled():
+                sleep_task.result()
+            return self._cancel_event.is_set()
+        except asyncio.CancelledError:
+            for task in (sleep_task, cancel_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(sleep_task, cancel_task, return_exceptions=True)
+            raise
+
+    async def _wait_for_cancel_or_timeout(self, timeout_s: float) -> bool:
+        """Sleep up to *timeout_s*, waking immediately when ``request_cancel()`` is called."""
+        if self._cancel_event.is_set():
+            return True
+        if timeout_s <= 0.0:
+            return False
+        try:
+            await asyncio.wait_for(self._cancel_event.wait(), timeout=timeout_s)
+            return True
+        except TimeoutError:
+            return self._cancel_event.is_set()
+
+    def _build_watch_point(
+        self,
+        *,
+        index: int,
+        png_bytes: bytes,
+        elapsed_s: float,
+        captured_at: datetime,
+        spec: WatchSpec,
+        profile: CalibrationProfile,
+    ) -> MeasurementPoint:
+        img, relpath, digest = self._write_and_record_frame(
+            png_bytes,
+            name_prefix="watch",
+            metadata={
+                "index": index,
+                "elapsed_s": elapsed_s,
+                "frame_timestamp_ms": elapsed_s * 1000.0,
+                "requested_settings": dict(spec.fixed_controls),
+            },
+        )
+
+        readouts_parsed: dict[str, float | int | str | None] = {}
+        readouts_units: dict[str, str | None] = {}
+        readouts_raw: dict[str, str] = {}
+        primary_unit: str | None = None
+
+        for ro_idx, ro_name in enumerate(spec.readouts):
+            ro_spec = profile.readouts[ro_name]
+            ro_ocr, ro_val, ro_unit = self.ocr.read_spec(img, ro_spec)
+            readouts_raw[ro_name] = join_ocr_text(ro_ocr)
+            readouts_parsed[ro_name] = ro_val
+            readouts_units[ro_name] = ro_unit
+            if ro_idx == 0:
+                primary_unit = ro_unit
+
+        primary_name = spec.readouts[0]
+        return MeasurementPoint(
+            index=index,
+            requested_settings=dict(spec.fixed_controls),
+            observed_settings={},
+            readout_name=primary_name,
+            raw_ocr_text=readouts_raw[primary_name],
+            parsed_value=readouts_parsed[primary_name],
+            parsed_unit=primary_unit,
+            readouts=readouts_parsed,
+            readout_units=readouts_units,
+            raw_readouts=readouts_raw,
+            screenshot_relpath=relpath,
+            screenshot_sha256=digest,
+            provenance="simulator_captured",
+            captured_at=captured_at,
+            elapsed_s=elapsed_s,
+            frame_timestamp_ms=elapsed_s * 1000.0,
+            controls_matched=None,
+        )
+
+    def _export_watch_dataset(
+        self,
+        *,
+        points: list[MeasurementPoint],
+        spec: WatchSpec,
+        pacing_mode: WatchPacingMode,
+        status: WatchStatus,
+        actual_duration_s: float,
+    ) -> tuple[str, str]:
+        colliding = [ro for ro in spec.readouts if ro in _WATCH_RESERVED_COLUMNS]
+        if colliding:
+            raise ValueError(
+                f"WatchSpec.readouts {colliding!r} collide with reserved watch dataset "
+                f"columns {sorted(_WATCH_RESERVED_COLUMNS)!r}; rename the readout(s) in "
+                "the calibration profile or set save_dataset=False"
+            )
+
+        rows: list[dict[str, Any]] = []
+        for pt in points:
+            row: dict[str, Any] = {
+                "index": pt.index,
+                "elapsed_s": pt.elapsed_s,
+                "frame_timestamp_ms": pt.frame_timestamp_ms,
+            }
+            for ro_name in spec.readouts:
+                row[ro_name] = pt.readouts.get(ro_name)
+            row["screenshot_relpath"] = pt.screenshot_relpath
+            row["screenshot_sha256"] = pt.screenshot_sha256
+            rows.append(row)
+
+        units: dict[str, str] = {
+            "elapsed_s": "s",
+            "frame_timestamp_ms": "ms",
+        }
+        for ro_name in spec.readouts:
+            for pt in points:
+                unit_val = pt.readout_units.get(ro_name)
+                if isinstance(unit_val, str) and unit_val.strip():
+                    units[ro_name] = unit_val.strip()
+                    break
+
+        notes = (
+            f"sim_watch capture ({pacing_mode}, status={status}, "
+            f"frames={len(points)}, duration={actual_duration_s:.3f}s, "
+            f"interval_ms={spec.interval_ms})"
+        )
+
+        if spec.dataset_id is not None:
+            ingested = data_ingest(
+                DatasetSpec(
+                    dataset_id=spec.dataset_id,
+                    source="simulator_captured",
+                    rows=rows,
+                    units=units,
+                    notes=notes,
+                ),
+                self.workspace,
+            )
+            assert ingested.dataset_id is not None
+            return (ingested.dataset_id, f"datasets/{ingested.dataset_id}.json")
+
+        datasets_dir = self.workspace.resolve_path("datasets")
+        seq = 0
+        if datasets_dir.is_dir():
+            for item in datasets_dir.iterdir():
+                match = _WATCH_DATASET_RE.match(item.name)
+                if match is not None:
+                    seq = max(seq, int(match.group(1)))
+        while True:
+            seq += 1
+            candidate_id = f"watch-{seq:04d}"
+            if self.workspace.resolve_path(f"datasets/{candidate_id}.json").exists():
+                continue
+            try:
+                ingested = data_ingest(
+                    DatasetSpec(
+                        dataset_id=candidate_id,
+                        source="simulator_captured",
+                        rows=rows,
+                        units=units,
+                        notes=notes,
+                    ),
+                    self.workspace,
+                )
+                assert ingested.dataset_id is not None
+                return (ingested.dataset_id, f"datasets/{ingested.dataset_id}.json")
+            except FileExistsError:
+                continue
+
+    async def watch(self, spec: WatchSpec | dict[str, Any]) -> WatchResult:
+        """Capture a timed transient / stopwatch sequence with hybrid pacing & provenance."""
+        validated = spec if isinstance(spec, WatchSpec) else WatchSpec.model_validate(spec)
+        profile = self._require_profile()
+
+        for ctrl_name in validated.fixed_controls:
+            if ctrl_name not in profile.controls:
+                raise KeyError(f"Fixed control {ctrl_name!r} not found in calibration profile")
+        for ro_name in validated.readouts:
+            if ro_name not in profile.readouts:
+                raise KeyError(f"Readout {ro_name!r} not found in calibration profile")
+
+        if validated.save_dataset:
+            colliding = [ro for ro in validated.readouts if ro in _WATCH_RESERVED_COLUMNS]
+            if colliding:
+                raise ValueError(
+                    f"WatchSpec.readouts {colliding!r} collide with reserved watch dataset "
+                    f"columns {sorted(_WATCH_RESERVED_COLUMNS)!r}; rename the readout(s) in "
+                    "the calibration profile or set save_dataset=False"
+                )
+
+        triggers: list[ActionStep] = (
+            [validated.trigger_action]
+            if validated.trigger_action is not None
+            else list(validated.trigger_actions)
+        )
+        for step in triggers:
+            if step.control is not None and step.control not in profile.controls:
+                raise KeyError(
+                    f"Trigger control {step.control!r} not found in calibration profile"
+                )
+
+        if validated.save_dataset and validated.dataset_id is not None:
+            target_ds = self.workspace.resolve_path(f"datasets/{validated.dataset_id}.json")
+            if target_ds.exists():
+                raise FileExistsError(
+                    f"Dataset {validated.dataset_id!r} already exists in run "
+                    f"{self.workspace.run_id}; use a unique dataset_id to preserve "
+                    "provenance immutability"
+                )
+
+        pacing_mode: WatchPacingMode = (
+            "inline_ocr"
+            if (validated.stop_when_stable_s is not None or validated.stop_readout is not None)
+            else "burst_post_ocr"
+        )
+        interval_s = validated.interval_ms / 1000.0
+        estimated_total = min(
+            validated.max_frames,
+            max(1, int(math.floor(validated.duration_s / interval_s)) + 1),
+        )
+
+        self.reset_cancel()
+        self.workspace.update_status(
+            phase="running",
+            message=(
+                f"Starting transient watch ({pacing_mode}, duration={validated.duration_s:.2f}s, "
+                f"interval={validated.interval_ms}ms)"
+            ),
+            source="simulator_captured",
+            progress_current=0,
+            progress_total=estimated_total,
+        )
+
+        points: list[MeasurementPoint] = []
+        raw_buffer: deque[tuple[bytes, float, datetime]] = deque()
+        t0: float | None = None
+        capture_finished = False
+        actual_duration_s = 0.0
+        status: WatchStatus = "complete"
+        stop_reason = f"Completed requested duration {validated.duration_s:.3f}s"
+        tracker = (
+            _StabilityTracker(
+                readouts=validated.readouts,
+                stop_when_stable_s=validated.stop_when_stable_s,
+                stability_tol=validated.stability_tol,
+            )
+            if validated.stop_when_stable_s is not None
+            else None
+        )
+
+        def _flush_burst_buffer() -> None:
+            while raw_buffer:
+                png_bytes, frame_elapsed_s, frame_captured_at = raw_buffer.popleft()
+                pt = self._build_watch_point(
+                    index=len(points),
+                    png_bytes=png_bytes,
+                    elapsed_s=frame_elapsed_s,
+                    captured_at=frame_captured_at,
+                    spec=validated,
+                    profile=profile,
+                )
+                points.append(pt)
+
+        try:
+            cancelled_during_setup = False
+            for ctrl_name, val in validated.fixed_controls.items():
+                if self._cancel_event.is_set():
+                    cancelled_during_setup = True
+                    break
+                await self._apply_single_control(ctrl_name, val)
+
+            if not cancelled_during_setup and self._cancel_event.is_set():
+                cancelled_during_setup = True
+
+            if not cancelled_during_setup and validated.settle_ms > 0:
+                if await self._sleep_ms_cancellable(validated.settle_ms):
+                    cancelled_during_setup = True
+
+            if not cancelled_during_setup and validated.blur_before_capture:
+                blur_target: PointPx | None = profile.blur_xy
+                if blur_target is None:
+                    for ctrl_name in validated.fixed_controls:
+                        ctrl = profile.controls.get(ctrl_name)
+                        if ctrl is not None and ctrl.blur_xy is not None:
+                            blur_target = ctrl.blur_xy
+                            break
+                if blur_target is not None:
+                    await self._blur_focus(blur_target)
+                elif self.header_height_px > 0:
+                    await self._blur_focus()
+                if self._cancel_event.is_set():
+                    cancelled_during_setup = True
+
+            if not cancelled_during_setup and triggers:
+                await self.act(triggers)
+                if self._cancel_event.is_set():
+                    cancelled_during_setup = True
+
+            if cancelled_during_setup:
+                status = "cancelled"
+                stop_reason = "Cooperative cancellation requested"
+                actual_duration_s = 0.0
+                capture_finished = True
+            else:
+                t0 = time.perf_counter()
+                frame_idx = 0
+                next_slot = 0
+
+                while True:
+                    if self._cancel_event.is_set():
+                        status = "cancelled"
+                        stop_reason = "Cooperative cancellation requested"
+                        break
+
+                    if frame_idx > 0:
+                        deadline = t0 + next_slot * interval_s
+                        now = time.perf_counter()
+                        if (now - t0) >= validated.duration_s or (
+                            deadline - t0
+                        ) > validated.duration_s + _FLOAT_EPS:
+                            status = "complete"
+                            stop_reason = (
+                                f"Completed requested duration {validated.duration_s:.3f}s"
+                            )
+                            break
+                        sleep_s = deadline - now
+                        if sleep_s > 0.0:
+                            if await self._wait_for_cancel_or_timeout(sleep_s):
+                                status = "cancelled"
+                                stop_reason = "Cooperative cancellation requested"
+                                break
+                            next_slot += 1
+                        else:
+                            await asyncio.sleep(0)
+                            if self._cancel_event.is_set():
+                                status = "cancelled"
+                                stop_reason = "Cooperative cancellation requested"
+                                break
+                            # Capture immediately now, and advance next_slot past any
+                            # missed ticks so a single slow frame cannot trigger a burst
+                            # storm of back-to-back duplicate frames.
+                            next_slot = max(
+                                next_slot + 1,
+                                int(math.floor((now - t0) / interval_s)) + 1,
+                            )
+                    else:
+                        next_slot = 1
+
+                    png_bytes = await self.page.screenshot(type="png")
+                    frame_elapsed_s = max(0.0, time.perf_counter() - t0)
+                    frame_captured_at = datetime.now(UTC)
+
+                    if pacing_mode == "burst_post_ocr":
+                        raw_buffer.append((png_bytes, frame_elapsed_s, frame_captured_at))
+                        captured_count = len(raw_buffer)
+                    else:
+                        point = self._build_watch_point(
+                            index=frame_idx,
+                            png_bytes=png_bytes,
+                            elapsed_s=frame_elapsed_s,
+                            captured_at=frame_captured_at,
+                            spec=validated,
+                            profile=profile,
+                        )
+                        points.append(point)
+                        captured_count = len(points)
+                        self._persist_partial_readings(
+                            kind="watch",
+                            status="running",
+                            points=points,
+                            extra={
+                                "pacing_mode": pacing_mode,
+                                "requested_duration_s": validated.duration_s,
+                                "interval_ms": validated.interval_ms,
+                                "readouts": list(validated.readouts),
+                            },
+                            record_provenance=False,
+                        )
+                        self.workspace.update_status(
+                            phase="running",
+                            message=(
+                                f"Watch captured frame {captured_count} "
+                                f"(t={frame_elapsed_s:.2f}s/{validated.duration_s:.2f}s)"
+                            ),
+                            progress_current=captured_count,
+                            progress_total=max(estimated_total, captured_count),
+                            metadata_updates={
+                                "latest_screenshot_relpath": point.screenshot_relpath
+                            },
+                        )
+
+                        if _check_threshold(point, validated):
+                            status = "stopped_threshold"
+                            stop_reason = (
+                                f"Threshold satisfied: {validated.stop_readout} "
+                                f"{validated.stop_op} {validated.stop_value}"
+                            )
+                            break
+                        if tracker is not None and tracker.update(point):
+                            status = "stopped_stable"
+                            stop_reason = (
+                                f"Readouts {validated.readouts} remained stable within "
+                                f"+/-{validated.stability_tol} for >= "
+                                f"{validated.stop_when_stable_s:.3f}s"
+                            )
+                            break
+
+                    frame_idx += 1
+
+                    if self._cancel_event.is_set():
+                        status = "cancelled"
+                        stop_reason = "Cooperative cancellation requested"
+                        break
+                    if captured_count >= validated.max_frames:
+                        status = "max_frames_reached"
+                        stop_reason = f"Reached max_frames={validated.max_frames}"
+                        break
+
+                actual_duration_s = max(0.0, time.perf_counter() - t0)
+                capture_finished = True
+
+            if pacing_mode == "burst_post_ocr":
+                _flush_burst_buffer()
+
+            missing_readouts = sum(
+                1
+                for pt in points
+                for ro_name in validated.readouts
+                if pt.readouts.get(ro_name) is None
+            )
+
+            dataset_id: str | None = None
+            dataset_relpath: str | None = None
+            if validated.save_dataset and points:
+                dataset_id, dataset_relpath = self._export_watch_dataset(
+                    points=points,
+                    spec=validated,
+                    pacing_mode=pacing_mode,
+                    status=status,
+                    actual_duration_s=actual_duration_s,
+                )
+
+            readings_relpath = self._persist_partial_readings(
+                kind="watch",
+                status=status,
+                points=points,
+                extra={
+                    "pacing_mode": pacing_mode,
+                    "requested_duration_s": validated.duration_s,
+                    "actual_duration_s": actual_duration_s,
+                    "interval_ms": validated.interval_ms,
+                    "readouts": list(validated.readouts),
+                    "stop_reason": stop_reason,
+                    "missing_readouts": missing_readouts,
+                    "dataset_id": dataset_id,
+                    "dataset_relpath": dataset_relpath,
+                },
+                record_provenance=True,
+            )
+
+            final_meta: dict[str, Any] = {}
+            if points:
+                final_meta["latest_screenshot_relpath"] = points[-1].screenshot_relpath
+            if dataset_id is not None:
+                final_meta["latest_watch_dataset_id"] = dataset_id
+
+            self.workspace.update_status(
+                phase="cancelled" if status == "cancelled" else "complete",
+                message=(
+                    f"Watch {status} ({len(points)} frames in "
+                    f"{actual_duration_s:.2f}s; {stop_reason})"
+                ),
+                progress_current=len(points),
+                progress_total=len(points),
+                metadata_updates=final_meta or None,
+            )
+
+            return WatchResult(
+                status=status,
+                pacing_mode=pacing_mode,
+                requested_duration_s=validated.duration_s,
+                actual_duration_s=actual_duration_s,
+                interval_ms=validated.interval_ms,
+                captured_frames=len(points),
+                missing_readouts=missing_readouts,
+                stop_reason=stop_reason,
+                readings_relpath=readings_relpath,
+                dataset_id=dataset_id,
+                dataset_relpath=dataset_relpath,
+                points=points,
+            )
+
+        except asyncio.CancelledError:
+            if t0 is not None and not capture_finished:
+                actual_duration_s = max(0.0, time.perf_counter() - t0)
+            if raw_buffer and not capture_finished:
+                try:
+                    _flush_burst_buffer()
+                except Exception:
+                    pass
+            self._persist_partial_readings(
+                kind="watch",
+                status="cancelled",
+                points=points,
+                extra={
+                    "pacing_mode": pacing_mode,
+                    "requested_duration_s": validated.duration_s,
+                    "actual_duration_s": actual_duration_s,
+                    "interval_ms": validated.interval_ms,
+                    "readouts": list(validated.readouts),
+                    "stop_reason": "External asyncio task cancellation",
+                },
+                record_provenance=True,
+            )
+            cancel_meta = (
+                {"latest_screenshot_relpath": points[-1].screenshot_relpath} if points else None
+            )
+            self.workspace.update_status(
+                phase="cancelled",
+                message=(
+                    f"Watch task cancelled after {len(points)} frames; "
+                    "partial evidence preserved."
+                ),
+                progress_current=len(points),
+                progress_total=max(estimated_total, len(points)),
+                metadata_updates=cancel_meta,
+            )
+            raise
+        except Exception as exc:
+            if t0 is not None and not capture_finished:
+                actual_duration_s = max(0.0, time.perf_counter() - t0)
+            if raw_buffer and not capture_finished:
+                try:
+                    _flush_burst_buffer()
+                except Exception:
+                    pass
+            self._persist_partial_readings(
+                kind="watch",
+                status="failed",
+                points=points,
+                extra={
+                    "pacing_mode": pacing_mode,
+                    "requested_duration_s": validated.duration_s,
+                    "actual_duration_s": actual_duration_s,
+                    "interval_ms": validated.interval_ms,
+                    "readouts": list(validated.readouts),
+                    "error": str(exc),
+                },
+                record_provenance=True,
+            )
+            fail_meta = (
+                {"latest_screenshot_relpath": points[-1].screenshot_relpath} if points else None
+            )
+            self.workspace.update_status(
+                phase="failed",
+                error=str(exc),
+                message=(
+                    f"Watch failed after {len(points)} frames; partial evidence preserved."
+                ),
+                progress_current=len(points),
+                progress_total=max(estimated_total, len(points)),
+                metadata_updates=fail_meta,
+            )
+            raise
+
     async def close(self) -> None:
         """Close Playwright page/context and stop the loopback runtime server if owned."""
         if self._closed:
@@ -1565,6 +2362,7 @@ class SimulatorManager:
 
         server: SimRuntimeServer | None = None
         swf_meta: SwfMeta | None = None
+        sim_sha256: str | None = None
         loopback_origin: str | None = None
         stage_w = viewport_width or 900
         stage_h = viewport_height or 700
@@ -1577,6 +2375,7 @@ class SimulatorManager:
                 header_height_px=header_height_px,
             )
             swf_meta = server.configure_swf(swf_path, self.config.local_assets_dir / "ruffle")
+            sim_sha256 = swf_meta.sha256
             loopback_origin = server.start()
             target_url = f"{loopback_origin}/index.html"
             stage_w = swf_meta.stage_width
@@ -1591,6 +2390,7 @@ class SimulatorManager:
                 header_height_px=0,
             )
             server.configure_html5_dir(html5_dir, entry_file=entry_file)
+            sim_sha256 = compute_html5_dir_sha256(html5_dir)
             loopback_origin = server.start()
             target_url = f"{loopback_origin}/"
             vp_w = viewport_width or 1024
@@ -1606,6 +2406,7 @@ class SimulatorManager:
                     f"URL origin {parsed.scheme}://{parsed.netloc} is not allowlisted. "
                     "Add it explicitly via PEA_ALLOWED_ORIGINS."
                 )
+            sim_sha256 = compute_url_sha256(url)
             target_url = url
             vp_w = viewport_width or 1024
             vp_h = viewport_height or 768
@@ -1623,11 +2424,19 @@ class SimulatorManager:
 
             session_id = f"sim-{secrets.token_hex(4)}"
             loaded_profile: CalibrationProfile | None = None
-            if swf_meta is not None:
-                loaded_profile = self.profile_store.load(
-                    swf_meta.sha256,
-                    expected_stage=(swf_meta.stage_width, swf_meta.stage_height),
-                )
+            if sim_sha256 is not None:
+                if swf_meta is not None:
+                    loaded_profile = self.profile_store.load(
+                        sim_sha256,
+                        expected_stage=(stage_w, stage_h),
+                    )
+                else:
+                    candidate_profile = self.profile_store.load(sim_sha256)
+                    if candidate_profile is not None and (
+                        candidate_profile.stage_width,
+                        candidate_profile.stage_height,
+                    ) == (stage_w, stage_h):
+                        loaded_profile = candidate_profile
 
             session = SimulatorSession(
                 session_id=session_id,
@@ -1643,6 +2452,7 @@ class SimulatorManager:
                 header_height_px=eff_header_h,
                 server=server,
                 swf_meta=swf_meta,
+                sim_sha256=sim_sha256,
                 profile=loaded_profile,
                 context=context,
             )
@@ -1736,7 +2546,9 @@ __all__ = [
     "SimulatorManager",
     "SimulatorSession",
     "StepperPlan",
+    "compute_html5_dir_sha256",
     "compute_stepper_plan",
+    "compute_url_sha256",
     "format_control_value",
     "render_annotated_overlay",
     "select_all_shortcut",

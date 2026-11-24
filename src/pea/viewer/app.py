@@ -6,6 +6,7 @@ import argparse
 import json
 import mimetypes
 import re
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit
@@ -35,6 +36,14 @@ _ALLOWED_FONT_FILES: frozenset[str] = frozenset({"NotoSans-Regular.ttf", "NotoSa
 _IMAGE_SUFFIXES: frozenset[str] = frozenset({".png", ".jpg", ".jpeg", ".webp"})
 _DOWNLOAD_ATTACHMENT_SUFFIXES: frozenset[str] = frozenset({".docx", ".zip"})
 _SANDBOXED_ACTIVE_SUFFIXES: frozenset[str] = frozenset({".html", ".htm", ".js", ".mjs", ".xhtml"})
+_VALID_PROVENANCE_SOURCES: frozenset[str] = frozenset(
+    {"simulator_captured", "bench_manual", "model_computed"}
+)
+_DATASET_META_CACHE_MAX = 256
+_DATASET_META_CACHE: OrderedDict[
+    tuple[str, int, int],
+    tuple[str | None, str | None, int, tuple[str, ...], str],
+] = OrderedDict()
 
 _DEFAULT_CSP = (
     "default-src 'self'; "
@@ -328,14 +337,24 @@ def _collect_downloads(workspace: RunWorkspace) -> dict[str, Any]:
 
     extra: list[dict[str, str]] = []
     standard = {pdf_rel, docx_rel, zip_rel, teacher_rel}
-    if workspace.reports_dir.is_dir():
-        for item in sorted(workspace.reports_dir.iterdir(), key=lambda p: p.name):
-            if not item.is_file() or item.name.endswith(".tmp"):
+    try:
+        reports_dir = workspace.resolve_path("reports")
+    except PathConfinementError:
+        reports_dir = None
+    if reports_dir is not None and reports_dir.is_dir():
+        for item in sorted(reports_dir.iterdir(), key=lambda p: p.name):
+            if item.name.startswith(".") or item.name.endswith(".tmp"):
                 continue
             if item.suffix.lower() not in (".pdf", ".docx", ".zip"):
                 continue
-            rel = item.relative_to(workspace.root).as_posix()
+            rel = f"reports/{item.name}"
             if rel in standard:
+                continue
+            try:
+                resolved_item = workspace.resolve_path(rel)
+            except PathConfinementError:
+                continue
+            if not resolved_item.is_file():
                 continue
             extra.append(
                 {
@@ -359,17 +378,27 @@ def _collect_downloads(workspace: RunWorkspace) -> dict[str, Any]:
 
 
 def _collect_figures(workspace: RunWorkspace) -> list[dict[str, Any]]:
-    if not workspace.figures_dir.is_dir():
+    try:
+        figures_dir = workspace.resolve_path("figures")
+    except PathConfinementError:
+        return []
+    if not figures_dir.is_dir():
         return []
     grouped: dict[str, dict[str, Any]] = {}
-    for item in sorted(workspace.figures_dir.iterdir(), key=lambda p: p.name):
-        if not item.is_file() or item.name.endswith(".tmp"):
+    for item in sorted(figures_dir.iterdir(), key=lambda p: p.name):
+        if item.name.startswith(".") or item.name.endswith(".tmp"):
             continue
         ext = item.suffix.lower()
         if ext not in (".svg", ".png"):
             continue
+        rel = f"figures/{item.name}"
+        try:
+            resolved_item = workspace.resolve_path(rel)
+        except PathConfinementError:
+            continue
+        if not resolved_item.is_file():
+            continue
         fig_id = item.stem
-        rel = item.relative_to(workspace.root).as_posix()
         entry = grouped.setdefault(
             fig_id,
             {
@@ -387,6 +416,60 @@ def _collect_figures(workspace: RunWorkspace) -> list[dict[str, Any]]:
             entry["png_relpath"] = rel
             entry["png_url"] = _artifact_url(workspace.run_id, rel)
     return list(grouped.values())
+
+
+def _read_dataset_metadata(
+    resolved: Path,
+) -> tuple[str | None, str | None, int, tuple[str, ...], str]:
+    """Read and cache dataset summary metadata keyed by ``(path, mtime_ns, size)``."""
+    try:
+        st = resolved.stat()
+    except OSError:
+        return None, None, 0, (), ""
+
+    cache_key = (str(resolved), st.st_mtime_ns, st.st_size)
+    cached = _DATASET_META_CACHE.get(cache_key)
+    if cached is not None:
+        _DATASET_META_CACHE.move_to_end(cache_key)
+        return cached
+
+    parsed_id: str | None = None
+    parsed_source: str | None = None
+    row_count = 0
+    columns: list[str] = []
+    notes = ""
+
+    try:
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        payload = None
+
+    if isinstance(payload, dict):
+        raw_id = payload.get("dataset_id")
+        if isinstance(raw_id, str) and raw_id.strip():
+            parsed_id = raw_id.strip()
+        raw_source = payload.get("source")
+        if isinstance(raw_source, str) and raw_source.strip() in _VALID_PROVENANCE_SOURCES:
+            parsed_source = raw_source.strip()
+        raw_rows = payload.get("rows")
+        if isinstance(raw_rows, list):
+            row_count = len(raw_rows)
+            seen_cols: set[str] = set()
+            for row in raw_rows:
+                if isinstance(row, dict):
+                    for key in row:
+                        if isinstance(key, str) and key not in seen_cols:
+                            seen_cols.add(key)
+                            columns.append(key)
+        raw_notes = payload.get("notes")
+        if isinstance(raw_notes, str):
+            notes = raw_notes
+
+    summary = (parsed_id, parsed_source, row_count, tuple(columns), notes)
+    _DATASET_META_CACHE[cache_key] = summary
+    if len(_DATASET_META_CACHE) > _DATASET_META_CACHE_MAX:
+        _DATASET_META_CACHE.popitem(last=False)
+    return summary
 
 
 def _summarize_run(workspace: RunWorkspace) -> dict[str, Any]:
@@ -438,19 +521,38 @@ def _detail_run(workspace: RunWorkspace) -> dict[str, Any]:
     except ValueError:
         calcs_count = 0
 
-    datasets: list[dict[str, str]] = []
-    ds_dir = workspace.root / "datasets"
-    if ds_dir.is_dir():
+    datasets: list[dict[str, Any]] = []
+    try:
+        ds_dir = workspace.resolve_path("datasets")
+    except PathConfinementError:
+        ds_dir = None
+    if ds_dir is not None and ds_dir.is_dir():
         for item in sorted(ds_dir.glob("*.json"), key=lambda p: p.name):
-            if item.is_file() and not item.name.endswith(".tmp"):
-                rel = item.relative_to(workspace.root).as_posix()
-                datasets.append(
-                    {
-                        "dataset_id": item.stem,
-                        "relpath": rel,
-                        "url": _artifact_url(workspace.run_id, rel),
-                    }
-                )
+            if item.name.startswith(".") or item.name.endswith(".tmp"):
+                continue
+            rel = f"datasets/{item.name}"
+            try:
+                resolved = workspace.resolve_path(rel)
+            except PathConfinementError:
+                continue
+            if not resolved.is_file():
+                continue
+
+            parsed_id, parsed_source, row_count, columns, notes = _read_dataset_metadata(resolved)
+            ds_id = parsed_id or item.stem
+            ds_source = source_by_relpath.get(rel) or parsed_source or "unspecified"
+
+            datasets.append(
+                {
+                    "dataset_id": ds_id,
+                    "relpath": rel,
+                    "url": _artifact_url(workspace.run_id, rel),
+                    "source": ds_source,
+                    "row_count": row_count,
+                    "columns": list(columns),
+                    "notes": notes,
+                }
+            )
 
     shots = _list_screenshots(workspace)
     latest_shot = _resolve_confined_image(
@@ -619,8 +721,16 @@ def create_viewer_app(
                 status_code=403,
             )
 
-        if resolved.name.endswith(".tmp") or ".tmp." in resolved.name:
-            return JSONResponse({"error": "Temporary files are not served"}, status_code=404)
+        rel_parts = resolved.relative_to(ws.root).parts
+        if (
+            any(part.startswith(".") for part in rel_parts)
+            or resolved.name.endswith(".tmp")
+            or ".tmp." in resolved.name
+        ):
+            return JSONResponse(
+                {"error": "Temporary or hidden files are not served"},
+                status_code=404,
+            )
         if not resolved.exists() or not resolved.is_file():
             return JSONResponse({"error": "Artifact not found"}, status_code=404)
 

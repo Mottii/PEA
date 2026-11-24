@@ -6,12 +6,12 @@ containing `manifest.json`, `launcher.mjs`, and companion documentation, and ver
   - Zero path traversal, absolute paths, drive prefixes, backslashes, or symlinks
   - Zero SWFs, PDFs, DOCX, ONNX models, WASM bundles, fonts, binaries, or secrets
   - Zero literal host home paths (macOS, Linux, or Windows user profile prefixes)
-  - Exact MCPB v0.3 manifest schema and 16-tool parity with `pea.mcp_server`
+  - Exact MCPB v0.3 manifest schema and 18-tool parity with `pea.mcp_server`
 
 Usage:
     .venv/bin/python scripts/build_mcpb.py
     .venv/bin/python scripts/build_mcpb.py --check
-    .venv/bin/python scripts/build_mcpb.py --audit dist/pea-mcp-0.2.0.mcpb
+    .venv/bin/python scripts/build_mcpb.py --audit dist/pea-mcp-0.3.0.mcpb
 """
 
 from __future__ import annotations
@@ -422,9 +422,10 @@ def main(argv: list[str] | None = None) -> int:
             for err in errors:
                 print(f"  - {err}", file=sys.stderr)
             return 1
+        tool_count = len(_expected_tool_names())
         print(
             f"OK: MCPB packaging v{version} verified "
-            f"(manifest v0.3, 16 tools, zero binaries/secrets/traversals)."
+            f"(manifest v0.3, {tool_count} tools, zero binaries/secrets/traversals)."
         )
         return 0
 

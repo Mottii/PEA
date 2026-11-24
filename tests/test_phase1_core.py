@@ -34,6 +34,7 @@ from pea.schemas import (
     CalibrationProfile,
     ComparisonOutput,
     ComparisonSpec,
+    ComputeSimResult,
     ComputeSimSpec,
     ControlSpec,
     DatasetSpec,
@@ -62,6 +63,7 @@ from pea.schemas import (
     SweepAxis,
     SweepSpec,
     SwfMeta,
+    WatchResult,
     WatchSpec,
 )
 from pea.workspace import STANDARD_RUN_SUBDIRS, WorkspaceManager, generate_run_id
@@ -77,7 +79,7 @@ SAMPLE_SHA256 = "35e4a257134073356c9796965ea3ea2d9362d51b2dc87486dc93e85a0fb96b1
 
 def test_python_runtime_and_version() -> None:
     assert sys.version_info[:2] == (3, 13), f"Expected Python 3.13, got {sys.version}"
-    assert pea.__version__ == "0.2.0"
+    assert pea.__version__ == "0.3.0"
 
 
 @pytest.mark.parametrize(
@@ -627,6 +629,792 @@ def test_schemas_json_round_trip_core_contracts() -> None:
         page_count=5,
     )
     assert ReportBuildResult.model_validate_json(build_res.model_dump_json()) == build_res
+
+
+def test_m2a_measurement_point_timing_and_schema_exports() -> None:
+    import pea.schemas as schemas_mod
+
+    expected_exports = {
+        "ComputeModelKind",
+        "ComputeSimResult",
+        "ComputeSimSpec",
+        "FftWindow",
+        "MeasurementPoint",
+        "OdeMethod",
+        "WatchPacingMode",
+        "WatchResult",
+        "WatchSpec",
+        "WatchStatus",
+        "WatchStopOp",
+    }
+    assert expected_exports <= set(schemas_mod.__all__)
+    for sym in expected_exports:
+        assert hasattr(schemas_mod, sym)
+
+    # Backwards-compatible MeasurementPoint without timing fields defaults to None
+    pt_legacy = MeasurementPoint(
+        screenshot_relpath="evidence/watch-0001.png",
+        screenshot_sha256=SAMPLE_SHA256,
+    )
+    assert pt_legacy.elapsed_s is None
+    assert pt_legacy.frame_timestamp_ms is None
+
+    # With timing fields (including zero boundary)
+    pt_timed = MeasurementPoint(
+        index=1,
+        readout_name="Vc",
+        parsed_value=3.68,
+        readouts={"Vc": 3.68, "t": 1.0},
+        screenshot_relpath="evidence/watch-0002.png",
+        screenshot_sha256=SAMPLE_SHA256,
+        elapsed_s=0.0,
+        frame_timestamp_ms=0.0,
+    )
+    assert MeasurementPoint.model_validate_json(pt_timed.model_dump_json()) == pt_timed
+
+    # Negative and non-finite timing fields rejected
+    for bad_kwargs in (
+        {"elapsed_s": -0.01},
+        {"frame_timestamp_ms": -1.0},
+        {"elapsed_s": float("inf")},
+        {"elapsed_s": float("nan")},
+        {"frame_timestamp_ms": float("inf")},
+        {"frame_timestamp_ms": float("nan")},
+    ):
+        with pytest.raises(ValidationError):
+            MeasurementPoint(
+                screenshot_relpath="evidence/watch-0003.png",
+                screenshot_sha256=SAMPLE_SHA256,
+                **bad_kwargs,  # type: ignore[arg-type]
+            )
+
+
+def test_m2a_watch_schemas_round_trip_and_validation() -> None:
+    # Full extended WatchSpec with trigger_actions, threshold stop (including 0.0), stability
+    watch_ext = WatchSpec(
+        readouts=["t", "Vc"],
+        duration_s=5.0,
+        interval_ms=100,
+        trigger_actions=[
+            ActionStep(action="click", control="reset"),
+            ActionStep(action="click", control="start"),
+        ],
+        stop_when_stable_s=0.8,
+        stability_tol=0.02,
+        stop_readout="Vc",
+        stop_op="le",
+        stop_value=0.0,
+        fixed_controls={"R": 10.0, "C": 100.0},
+        max_frames=2000,
+        blur_before_capture=True,
+        settle_ms=30_000,
+        save_dataset=True,
+        dataset_id="rc_discharge_01",
+    )
+    assert WatchSpec.model_validate_json(watch_ext.model_dump_json()) == watch_ext
+
+    # Defaults check on minimal WatchSpec
+    watch_min = WatchSpec(readouts=["Vc"], duration_s=2.0)
+    assert watch_min.interval_ms == 250
+    assert watch_min.max_frames == 500
+    assert watch_min.stability_tol == 0.0
+    assert watch_min.blur_before_capture is True
+    assert watch_min.settle_ms == 0
+    assert watch_min.save_dataset is True
+    assert watch_min.dataset_id is None
+    assert watch_min.trigger_actions == []
+
+    # Reject both trigger_action and non-empty trigger_actions
+    with pytest.raises(ValidationError, match="trigger_action"):
+        WatchSpec(
+            readouts=["Vc"],
+            duration_s=2.0,
+            trigger_action=ActionStep(action="click", x=10, y=10),
+            trigger_actions=[ActionStep(action="click", x=20, y=20)],
+        )
+
+    # Reject partial threshold stop fields
+    for partial in (
+        {"stop_readout": "Vc"},
+        {"stop_op": "le"},
+        {"stop_value": 1.0},
+        {"stop_readout": "Vc", "stop_op": "le"},
+        {"stop_readout": "Vc", "stop_value": 1.0},
+        {"stop_op": "lt", "stop_value": 1.0},
+    ):
+        with pytest.raises(ValidationError, match="stop_readout"):
+            WatchSpec(readouts=["Vc"], duration_s=2.0, **partial)  # type: ignore[arg-type]
+
+    # Reject stop_readout not in readouts
+    with pytest.raises(ValidationError, match="must be one of"):
+        WatchSpec(
+            readouts=["Vc"],
+            duration_s=2.0,
+            stop_readout="I",
+            stop_op="le",
+            stop_value=0.1,
+        )
+
+    # Reject non-finite floats across duration_s, stability_tol, stop_value, stop_when_stable_s
+    for bad_float in (float("inf"), float("-inf"), float("nan")):
+        with pytest.raises(ValidationError):
+            WatchSpec(readouts=["Vc"], duration_s=bad_float)
+        with pytest.raises(ValidationError):
+            WatchSpec(readouts=["Vc"], duration_s=2.0, stability_tol=bad_float)
+        with pytest.raises(ValidationError):
+            WatchSpec(readouts=["Vc"], duration_s=2.0, stop_when_stable_s=bad_float)
+        with pytest.raises(ValidationError):
+            WatchSpec(
+                readouts=["Vc"],
+                duration_s=2.0,
+                stop_readout="Vc",
+                stop_op="le",
+                stop_value=bad_float,
+            )
+        with pytest.raises(ValidationError):
+            WatchSpec(readouts=["Vc"], duration_s=2.0, fixed_controls={"R": bad_float})
+
+    # Reject out-of-bounds caps, empty/duplicate readouts, empty dataset_id, extra fields
+    with pytest.raises(ValidationError):
+        WatchSpec(readouts=["Vc"], duration_s=2.0, max_frames=2001)
+    with pytest.raises(ValidationError):
+        WatchSpec(readouts=["Vc"], duration_s=2.0, max_frames=0)
+    with pytest.raises(ValidationError):
+        WatchSpec(readouts=["Vc"], duration_s=2.0, settle_ms=30_001)
+    with pytest.raises(ValidationError):
+        WatchSpec(readouts=["Vc", "Vc"], duration_s=2.0)
+    with pytest.raises(ValidationError):
+        WatchSpec(readouts=["  "], duration_s=2.0)
+    with pytest.raises(ValidationError):
+        WatchSpec(readouts=["Vc"], duration_s=2.0, dataset_id="   ")
+    with pytest.raises(ValidationError):
+        WatchSpec(readouts=["Vc"], duration_s=2.0, dataset_id="../escape")
+    with pytest.raises(ValidationError):
+        WatchSpec(readouts=["Vc"], duration_s=2.0, dataset_id="dir/name")
+    with pytest.raises(ValidationError):
+        WatchSpec(readouts=["Vc"], duration_s=2.0, save_dataset=False, dataset_id="rc_01")
+    with pytest.raises(ValidationError):
+        WatchSpec(readouts=["Vc"], duration_s=2.0, fixed_controls={"  ": 1.0})
+    with pytest.raises(ValidationError):
+        WatchSpec(readouts=["Vc"], duration_s=2.0, unknown_flag=True)  # type: ignore[call-arg]
+
+    # WatchResult round-trip and path/float validation
+    pt = MeasurementPoint(
+        index=0,
+        readout_name="Vc",
+        parsed_value=10.0,
+        readouts={"Vc": 10.0},
+        screenshot_relpath="evidence/watch-0001.png",
+        screenshot_sha256=SAMPLE_SHA256,
+        elapsed_s=0.0,
+        frame_timestamp_ms=0.0,
+    )
+    watch_res = WatchResult(
+        status="stopped_threshold",
+        pacing_mode="inline_ocr",
+        requested_duration_s=5.0,
+        actual_duration_s=2.34,
+        interval_ms=100,
+        captured_frames=1,
+        missing_readouts=0,
+        stop_reason="threshold Vc <= 1.0",
+        readings_relpath="readings/watch-0001.json",
+        dataset_id="watch-0001",
+        dataset_relpath="datasets/watch-0001.json",
+        points=[pt],
+    )
+    assert WatchResult.model_validate_json(watch_res.model_dump_json()) == watch_res
+
+    with pytest.raises(ValidationError):
+        WatchResult(
+            status="complete",
+            pacing_mode="burst_post_ocr",
+            requested_duration_s=5.0,
+            actual_duration_s=5.0,
+            interval_ms=100,
+            captured_frames=0,
+            stop_reason="done",
+            readings_relpath="../escape.json",
+        )
+    with pytest.raises(ValidationError):
+        WatchResult(
+            status="complete",
+            pacing_mode="burst_post_ocr",
+            requested_duration_s=float("inf"),
+            actual_duration_s=5.0,
+            interval_ms=100,
+            captured_frames=0,
+            stop_reason="done",
+            readings_relpath="readings/watch-0001.json",
+        )
+    with pytest.raises(ValidationError):
+        WatchResult(
+            status="complete",
+            pacing_mode="burst_post_ocr",
+            requested_duration_s=5.0,
+            actual_duration_s=5.0,
+            interval_ms=100,
+            captured_frames=0,
+            stop_reason="done",
+            readings_relpath="readings/watch-0001.json",
+            dataset_relpath="../escape.json",
+        )
+    # WatchResult invariants: captured_frames == len(points), coupled dataset fields, confined id
+    with pytest.raises(ValidationError, match="captured_frames"):
+        WatchResult(
+            status="complete",
+            pacing_mode="burst_post_ocr",
+            requested_duration_s=5.0,
+            actual_duration_s=5.0,
+            interval_ms=100,
+            captured_frames=3,
+            stop_reason="done",
+            readings_relpath="readings/watch-0001.json",
+            points=[],
+        )
+    with pytest.raises(ValidationError, match="dataset_id"):
+        WatchResult(
+            status="complete",
+            pacing_mode="burst_post_ocr",
+            requested_duration_s=5.0,
+            actual_duration_s=5.0,
+            interval_ms=100,
+            captured_frames=0,
+            stop_reason="done",
+            readings_relpath="readings/watch-0001.json",
+            dataset_id="watch-0001",
+            dataset_relpath=None,
+        )
+    with pytest.raises(ValidationError, match="dataset_id"):
+        WatchResult(
+            status="complete",
+            pacing_mode="burst_post_ocr",
+            requested_duration_s=5.0,
+            actual_duration_s=5.0,
+            interval_ms=100,
+            captured_frames=0,
+            stop_reason="done",
+            readings_relpath="readings/watch-0001.json",
+            dataset_id=None,
+            dataset_relpath="datasets/watch-0001.json",
+        )
+    with pytest.raises(ValidationError, match="confined identifier"):
+        WatchResult(
+            status="complete",
+            pacing_mode="burst_post_ocr",
+            requested_duration_s=5.0,
+            actual_duration_s=5.0,
+            interval_ms=100,
+            captured_frames=0,
+            stop_reason="done",
+            readings_relpath="readings/watch-0001.json",
+            dataset_id="../escape",
+            dataset_relpath="datasets/watch-0001.json",
+        )
+    with pytest.raises(ValidationError):
+        WatchSpec(
+            readouts=["Vc"],
+            duration_s=2.0,
+            stop_readout="Vc",
+            stop_op="eq",  # type: ignore[arg-type]
+            stop_value=1.0,
+        )
+    with pytest.raises(ValidationError):
+        watch_ext.stop_value = float("nan")
+
+
+def test_m2a_compute_sim_schemas_round_trip_and_validation() -> None:
+    # 1. 1D ODE with single expression defaults state_variables to ["y"]
+    ode_1d = ComputeSimSpec(
+        model_kind="ode_ivp",
+        expression="-y / (R * C)",
+        parameters={"R": 10_000.0, "C": 1e-4},
+        grid_start=0.0,
+        grid_stop=5.0,
+        initial_state=[10.0],
+    )
+    assert ode_1d.grid_variable == "t"
+    assert ode_1d.state_variables == ["y"]
+    assert ode_1d.ode_method == "RK45"
+    assert ode_1d.provenance == "model_computed"
+    assert ComputeSimSpec.model_validate_json(ode_1d.model_dump_json()) == ode_1d
+
+    # 1D ODE with explicit custom state variable name
+    ode_1d_named = ComputeSimSpec(
+        model_kind="ode_ivp",
+        expression="-Vc / tau",
+        state_variables=["Vc"],
+        parameters={"tau": 1.0},
+        grid_start=0.0,
+        grid_stop=3.0,
+        initial_state=[10.0],
+        ode_method="Radau",
+    )
+    assert ComputeSimSpec.model_validate_json(ode_1d_named.model_dump_json()) == ode_1d_named
+
+    # 2. Coupled 2D ODE (RLC) with expressions + state_variables
+    ode_2d = ComputeSimSpec(
+        model_kind="ode_ivp",
+        expressions=["i", "-(R / L) * i - (1.0 / (L * C)) * q"],
+        state_variables=["q", "i"],
+        parameters={"R": 5.0, "L": 0.005, "C": 32e-6},
+        grid_variable="t",
+        grid_start=0.0,
+        grid_stop=0.05,
+        grid_points=500,
+        initial_state=[1e-4, 0.0],
+        ode_method="BDF",
+        rtol=1e-7,
+        atol=1e-10,
+        max_nfev=100_000,
+        timeout_s=10.0,
+        dataset_id="rlc_ode_01",
+        units={"t": "s", "q": "C", "i": "A"},
+        notes="Damped RLC",
+    )
+    assert ComputeSimSpec.model_validate_json(ode_2d.model_dump_json()) == ode_2d
+
+    # 16D ODE allowed; 17D rejected
+    ode_16d = ComputeSimSpec(
+        model_kind="ode_ivp",
+        expressions=[f"-x{k}" for k in range(16)],
+        state_variables=[f"x{k}" for k in range(16)],
+        grid_start=0.0,
+        grid_stop=1.0,
+        initial_state=[1.0] * 16,
+    )
+    assert len(ode_16d.state_variables) == 16
+    with pytest.raises(ValidationError, match="at most 16"):
+        ComputeSimSpec(
+            model_kind="ode_ivp",
+            expressions=[f"-x{k}" for k in range(17)],
+            state_variables=[f"x{k}" for k in range(17)],
+            grid_start=0.0,
+            grid_stop=1.0,
+            initial_state=[1.0] * 17,
+        )
+
+    # ODE rejection rules
+    with pytest.raises(ValidationError, match="grid_stop > grid_start"):
+        ComputeSimSpec(
+            model_kind="ode_ivp",
+            expression="-y",
+            grid_start=5.0,
+            grid_stop=5.0,
+            initial_state=[1.0],
+        )
+    with pytest.raises(ValidationError, match="grid_start"):
+        ComputeSimSpec(model_kind="ode_ivp", expression="-y", initial_state=[1.0])
+    with pytest.raises(ValidationError, match="initial_state"):
+        ComputeSimSpec(model_kind="ode_ivp", expression="-y", grid_start=0.0, grid_stop=1.0)
+    with pytest.raises(ValidationError, match="len\\(initial_state\\) == 1"):
+        ComputeSimSpec(
+            model_kind="ode_ivp",
+            expression="-y",
+            grid_start=0.0,
+            grid_stop=1.0,
+            initial_state=[1.0, 0.0],
+        )
+    with pytest.raises(ValidationError, match="len\\(state_variables\\)"):
+        ComputeSimSpec(
+            model_kind="ode_ivp",
+            expressions=["-y"],
+            grid_start=0.0,
+            grid_stop=1.0,
+            initial_state=[1.0],
+        )
+    with pytest.raises(ValidationError, match="distinct from grid_variable"):
+        ComputeSimSpec(
+            model_kind="ode_ivp",
+            expression="-y",
+            grid_variable="y",
+            grid_start=0.0,
+            grid_stop=1.0,
+            initial_state=[1.0],
+        )
+    with pytest.raises(ValidationError, match="distinct from parameters"):
+        ComputeSimSpec(
+            model_kind="ode_ivp",
+            expression="-y",
+            parameters={"y": 2.0},
+            grid_start=0.0,
+            grid_stop=1.0,
+            initial_state=[1.0],
+        )
+    with pytest.raises(ValidationError, match="Duplicate state variable"):
+        ComputeSimSpec(
+            model_kind="ode_ivp",
+            expressions=["-q", "-q"],
+            state_variables=["q", "q"],
+            grid_start=0.0,
+            grid_stop=1.0,
+            initial_state=[1.0, 0.0],
+        )
+    for bad_ident in ("1bad", "for", "__import__", "a-b"):
+        with pytest.raises(ValidationError, match="Python identifier"):
+            ComputeSimSpec(
+                model_kind="ode_ivp",
+                expression="-x",
+                state_variables=[bad_ident],
+                grid_start=0.0,
+                grid_stop=1.0,
+                initial_state=[1.0],
+            )
+        with pytest.raises(ValidationError, match="Python identifier"):
+            ComputeSimSpec(
+                model_kind="ode_ivp",
+                expression="-y",
+                parameters={bad_ident: 1.0},
+                grid_start=0.0,
+                grid_stop=1.0,
+                initial_state=[1.0],
+            )
+
+    # 3. algebraic_grid (single expression, descending grid, and multi-expression)
+    alg_desc = ComputeSimSpec(
+        model_kind="algebraic_grid",
+        expression="sin(w)",
+        grid_variable="w",
+        grid_start=10.0,
+        grid_stop=0.0,
+        state_variables=["amp"],
+    )
+    assert ComputeSimSpec.model_validate_json(alg_desc.model_dump_json()) == alg_desc
+
+    alg_multi = ComputeSimSpec(
+        model_kind="algebraic_grid",
+        expressions=["cos(t)", "sin(t)"],
+        state_variables=["x", "y"],
+        grid_start=0.0,
+        grid_stop=6.28,
+    )
+    assert ComputeSimSpec.model_validate_json(alg_multi.model_dump_json()) == alg_multi
+
+    # algebraic_grid rejections
+    with pytest.raises(ValidationError, match="grid_stop != grid_start"):
+        ComputeSimSpec(
+            model_kind="algebraic_grid",
+            expression="t**2",
+            grid_start=1.0,
+            grid_stop=1.0,
+        )
+    with pytest.raises(ValidationError, match="grid_start"):
+        ComputeSimSpec(model_kind="algebraic_grid", expression="t**2")
+    with pytest.raises(ValidationError, match="cannot specify both"):
+        ComputeSimSpec(
+            model_kind="algebraic_grid",
+            expression="t",
+            expressions=["t"],
+            state_variables=["a"],
+            grid_start=0.0,
+            grid_stop=1.0,
+        )
+    with pytest.raises(ValidationError, match="distinct from grid_variable"):
+        ComputeSimSpec(
+            model_kind="algebraic_grid",
+            expression="y + 1",
+            grid_variable="y",
+            grid_start=0.0,
+            grid_stop=1.0,
+        )
+    with pytest.raises(ValidationError, match="collide with parameters"):
+        ComputeSimSpec(
+            model_kind="algebraic_grid",
+            expression="t + 1",
+            parameters={"t": 2.0},
+            grid_variable="t",
+            grid_start=0.0,
+            grid_stop=1.0,
+        )
+    with pytest.raises(ValidationError, match="only valid for"):
+        ComputeSimSpec(
+            model_kind="algebraic_grid",
+            expression="t",
+            grid_start=0.0,
+            grid_stop=1.0,
+            input_dataset_id="ds1",
+        )
+    with pytest.raises(ValidationError, match="only valid for"):
+        ComputeSimSpec(
+            model_kind="ode_ivp",
+            expression="-y",
+            grid_start=0.0,
+            grid_stop=1.0,
+            initial_state=[1.0],
+            input_dataset_id="ds1",
+        )
+    with pytest.raises(ValidationError, match="must not be empty"):
+        ComputeSimSpec(
+            model_kind="algebraic_grid",
+            expressions=["t", "  "],
+            state_variables=["a", "b"],
+            grid_start=0.0,
+            grid_stop=1.0,
+        )
+
+    # 4. fft_spectrum: dataset-backed (grid_start/grid_stop optional!) and inline
+    fft_ds = ComputeSimSpec(
+        model_kind="fft_spectrum",
+        input_dataset_id="watch-0001",
+        time_column="elapsed_s",
+        signal_column="Vc",
+        window="hann",
+        detrend_mean=True,
+    )
+    assert fft_ds.grid_start is None
+    assert fft_ds.grid_stop is None
+    assert ComputeSimSpec.model_validate_json(fft_ds.model_dump_json()) == fft_ds
+
+    fft_inline = ComputeSimSpec(
+        model_kind="fft_spectrum",
+        expression="cos(2 * pi * f0 * t)",
+        parameters={"f0": 2.0},
+        grid_variable="t",
+        grid_start=0.0,
+        grid_stop=4.0,
+        grid_points=256,
+        window="hann",
+    )
+    assert ComputeSimSpec.model_validate_json(fft_inline.model_dump_json()) == fft_inline
+
+    # fft_spectrum rejections
+    with pytest.raises(ValidationError, match="must not specify 'expression'"):
+        ComputeSimSpec(
+            model_kind="fft_spectrum",
+            input_dataset_id="watch-0001",
+            time_column="elapsed_s",
+            signal_column="Vc",
+            expression="cos(t)",
+        )
+    with pytest.raises(ValidationError, match="must not specify 'grid_start'"):
+        ComputeSimSpec(
+            model_kind="fft_spectrum",
+            input_dataset_id="watch-0001",
+            time_column="elapsed_s",
+            signal_column="Vc",
+            grid_start=0.0,
+            grid_stop=1.0,
+        )
+    with pytest.raises(ValidationError, match="requires non-empty"):
+        ComputeSimSpec(
+            model_kind="fft_spectrum",
+            input_dataset_id="watch-0001",
+            time_column="elapsed_s",
+        )
+    with pytest.raises(ValidationError, match="single 'expression'"):
+        ComputeSimSpec(
+            model_kind="fft_spectrum",
+            expressions=["cos(t)"],
+            grid_start=0.0,
+            grid_stop=1.0,
+            grid_points=16,
+        )
+    with pytest.raises(ValidationError, match="grid_points >= 4"):
+        ComputeSimSpec(
+            model_kind="fft_spectrum",
+            expression="cos(t)",
+            grid_start=0.0,
+            grid_stop=1.0,
+            grid_points=3,
+        )
+    with pytest.raises(ValidationError, match="grid_stop > grid_start"):
+        ComputeSimSpec(
+            model_kind="fft_spectrum",
+            expression="cos(t)",
+            grid_start=1.0,
+            grid_stop=0.0,
+            grid_points=16,
+        )
+
+    # General ComputeSimSpec bounds, finite, enum, validate_assignment & provenance checks
+    for bad_spec_kwargs in (
+        {"grid_points": 50_001},
+        {"grid_stop": float("inf")},
+        {"ode_method": "Euler"},
+        {"window": "hamming"},
+        {"max_nfev": 9},
+        {"max_nfev": 250_001},
+        {"timeout_s": 0.0},
+        {"timeout_s": 30.1},
+        {"rtol": 0.0},
+        {"rtol": 0.2},
+        {"atol": 0.0},
+        {"atol": 0.2},
+        {"provenance": "simulator_captured"},
+    ):
+        base: dict[str, object] = {
+            "model_kind": "algebraic_grid",
+            "expression": "t",
+            "grid_start": 0.0,
+            "grid_stop": 1.0,
+        }
+        base.update(bad_spec_kwargs)
+        with pytest.raises(ValidationError):
+            ComputeSimSpec(**base)  # type: ignore[arg-type]
+
+    # validate_assignment catches post-construction invalid mutations without synthesizing
+    # invalid default state_variables before collision checks
+    with pytest.raises(ValidationError):
+        ode_1d.grid_variable = "y"
+
+    ode_y_grid = ComputeSimSpec(
+        model_kind="ode_ivp",
+        expression="-Vc",
+        grid_variable="y",
+        state_variables=["Vc"],
+        grid_start=0.0,
+        grid_stop=1.0,
+        initial_state=[10.0],
+    )
+    with pytest.raises(ValidationError, match="distinct from grid_variable"):
+        ode_y_grid.state_variables = []
+    assert ode_y_grid.state_variables != ["y"]
+
+    # Cross-mode field exclusions, algebraic_grid 16-expression cap, confined dataset IDs & units
+    with pytest.raises(ValidationError, match="initial_state"):
+        ComputeSimSpec(
+            model_kind="algebraic_grid",
+            expression="t**2",
+            grid_start=0.0,
+            grid_stop=1.0,
+            initial_state=[1.0],
+        )
+    with pytest.raises(ValidationError, match="at most 16"):
+        ComputeSimSpec(
+            model_kind="algebraic_grid",
+            expressions=["t"] * 17,
+            state_variables=[f"y{k}" for k in range(17)],
+            grid_start=0.0,
+            grid_stop=1.0,
+        )
+    with pytest.raises(ValidationError, match="initial_state"):
+        ComputeSimSpec(
+            model_kind="fft_spectrum",
+            input_dataset_id="watch-0001",
+            time_column="elapsed_s",
+            signal_column="Vc",
+            initial_state=[1.0],
+        )
+    with pytest.raises(ValidationError, match="state_variables"):
+        ComputeSimSpec(
+            model_kind="fft_spectrum",
+            input_dataset_id="watch-0001",
+            time_column="elapsed_s",
+            signal_column="Vc",
+            state_variables=["y"],
+        )
+    with pytest.raises(ValidationError, match="parameters"):
+        ComputeSimSpec(
+            model_kind="fft_spectrum",
+            input_dataset_id="watch-0001",
+            time_column="elapsed_s",
+            signal_column="Vc",
+            parameters={"k": 1.0},
+        )
+    with pytest.raises(ValidationError, match="state_variables"):
+        ComputeSimSpec(
+            model_kind="fft_spectrum",
+            expression="sin(t)",
+            grid_start=0.0,
+            grid_stop=1.0,
+            grid_points=16,
+            state_variables=["y"],
+        )
+    with pytest.raises(ValidationError, match="confined identifier"):
+        ComputeSimSpec(
+            model_kind="algebraic_grid",
+            expression="t",
+            grid_start=0.0,
+            grid_stop=1.0,
+            dataset_id="../escape",
+        )
+    with pytest.raises(ValidationError, match="confined identifier"):
+        ComputeSimSpec(
+            model_kind="fft_spectrum",
+            input_dataset_id="../escape",
+            time_column="elapsed_s",
+            signal_column="Vc",
+        )
+    with pytest.raises(ValidationError, match="units keys"):
+        ComputeSimSpec(
+            model_kind="algebraic_grid",
+            expression="t",
+            grid_start=0.0,
+            grid_stop=1.0,
+            units={"  ": "s"},
+        )
+
+    # 5. ComputeSimResult round-trip and strict provenance/path/sha/invariant checks
+    comp_res = ComputeSimResult(
+        model_kind="ode_ivp",
+        dataset_id="compute-ode_ivp-0001",
+        dataset_relpath="datasets/compute-ode_ivp-0001.json",
+        dataset_sha256=SAMPLE_SHA256,
+        row_count=200,
+        columns=["t", "y"],
+        units={"t": "s", "y": "V"},
+        solver_meta={"method": "RK45", "nfev": 62, "status": 0},
+        preview_rows=[{"t": 0.0, "y": 10.0}],
+    )
+    assert comp_res.provenance == "model_computed"
+    assert ComputeSimResult.model_validate_json(comp_res.model_dump_json()) == comp_res
+
+    with pytest.raises(ValidationError):
+        ComputeSimResult(
+            model_kind="ode_ivp",
+            provenance="simulator_captured",  # type: ignore[arg-type]
+            dataset_id="ds1",
+            dataset_relpath="datasets/ds1.json",
+            dataset_sha256=SAMPLE_SHA256,
+            row_count=1,
+            columns=["t", "y"],
+        )
+    with pytest.raises(ValidationError):
+        ComputeSimResult(
+            model_kind="ode_ivp",
+            dataset_id="ds1",
+            dataset_relpath="../escape.json",
+            dataset_sha256=SAMPLE_SHA256,
+            row_count=1,
+            columns=["t", "y"],
+        )
+    with pytest.raises(ValidationError):
+        ComputeSimResult(
+            model_kind="ode_ivp",
+            dataset_id="ds1",
+            dataset_relpath="datasets/ds1.json",
+            dataset_sha256="not-a-sha",
+            row_count=1,
+            columns=["t", "y"],
+        )
+    with pytest.raises(ValidationError, match="confined identifier"):
+        ComputeSimResult(
+            model_kind="ode_ivp",
+            dataset_id="../escape",
+            dataset_relpath="datasets/ds1.json",
+            dataset_sha256=SAMPLE_SHA256,
+            row_count=1,
+            columns=["t", "y"],
+        )
+    with pytest.raises(ValidationError, match="duplicates"):
+        ComputeSimResult(
+            model_kind="ode_ivp",
+            dataset_id="ds1",
+            dataset_relpath="datasets/ds1.json",
+            dataset_sha256=SAMPLE_SHA256,
+            row_count=1,
+            columns=["t", "t"],
+        )
+    with pytest.raises(ValidationError, match="preview_rows"):
+        ComputeSimResult(
+            model_kind="ode_ivp",
+            dataset_id="ds1",
+            dataset_relpath="datasets/ds1.json",
+            dataset_sha256=SAMPLE_SHA256,
+            row_count=0,
+            columns=["t", "y"],
+            preview_rows=[{"t": 0.0, "y": 1.0}],
+        )
 
 
 # ---------------------------------------------------------------------------

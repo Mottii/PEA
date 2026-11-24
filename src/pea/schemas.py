@@ -1,14 +1,17 @@
-"""Frozen Pydantic v2 data contracts for PEA v2 (M1 + M2-ready interfaces)."""
+"""Frozen Pydantic v2 data contracts for PEA v2 (M1 + M2 interfaces)."""
 
 from __future__ import annotations
 
+import keyword
+import math
 import re
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_DATASET_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 BBoxPx = tuple[int, int, int, int]
 BBoxNorm = tuple[float, float, float, float]
@@ -25,6 +28,14 @@ CommitMode = Literal["enter", "step_interior", "click", "blur"]
 ParseMode = Literal["float", "int", "text"]
 ActionKind = Literal["click", "double_click", "drag", "type", "key", "wait", "set_stepper", "blur"]
 SearchMode = Literal["max", "min", "plateau_max", "threshold"]
+WatchStopOp = Literal["le", "lt", "ge", "gt"]
+WatchPacingMode = Literal["burst_post_ocr", "inline_ocr"]
+WatchStatus = Literal[
+    "complete", "stopped_stable", "stopped_threshold", "max_frames_reached", "cancelled"
+]
+ComputeModelKind = Literal["ode_ivp", "algebraic_grid", "fft_spectrum"]
+OdeMethod = Literal["RK45", "Radau", "BDF"]
+FftWindow = Literal["none", "hann"]
 ReportLanguage = Literal["en", "ru"]
 
 
@@ -33,6 +44,20 @@ def _validate_sha256(value: str) -> str:
     if not _SHA256_RE.match(lowered):
         raise ValueError(f"Expected 64-char hex SHA-256 digest; got {value!r}")
     return lowered
+
+
+def _validate_finite(value: float, field_name: str) -> float:
+    if not math.isfinite(value):
+        raise ValueError(f"{field_name} must be finite; got {value!r}")
+    return value
+
+
+def _validate_identifier(name: str, context: str) -> str:
+    if not name or not name.isidentifier() or keyword.iskeyword(name) or "__" in name:
+        raise ValueError(
+            f"{context} must be a valid non-keyword Python identifier without '__'; got {name!r}"
+        )
+    return name
 
 
 def _validate_bbox_px(bbox: BBoxPx, *, require_non_empty: bool = False) -> BBoxPx:
@@ -57,6 +82,16 @@ def _validate_relpath(relpath: str) -> str:
     parts = re.split(r"[/\\]", cleaned)
     if ".." in parts:
         raise ValueError(f"Relative path must not contain '..': {relpath!r}")
+    return cleaned
+
+
+def _validate_dataset_id(value: str, field_name: str) -> str:
+    cleaned = value.strip()
+    if not cleaned or cleaned in (".", "..") or not _DATASET_ID_RE.match(cleaned):
+        raise ValueError(
+            f"{field_name} must be a non-empty confined identifier matching "
+            f"[A-Za-z0-9._-]+ (not '.' or '..'); got {value!r}"
+        )
     return cleaned
 
 
@@ -228,7 +263,7 @@ class CalibrationProfile(StrictModel):
 
 
 # ---------------------------------------------------------------------------
-# Simulator Primitives (M1 + M2 Stubs)
+# Simulator Primitives (M1 + M2)
 # ---------------------------------------------------------------------------
 
 
@@ -353,6 +388,8 @@ class MeasurementPoint(StrictModel):
     screenshot_sha256: str
     provenance: ProvenanceSource = "simulator_captured"
     captured_at: datetime | None = None
+    elapsed_s: float | None = Field(default=None, ge=0.0)
+    frame_timestamp_ms: float | None = Field(default=None, ge=0.0)
     controls_matched: bool | None = None
 
     @field_validator("screenshot_relpath")
@@ -364,6 +401,15 @@ class MeasurementPoint(StrictModel):
     @classmethod
     def _check_sha256(cls, value: str) -> str:
         return _validate_sha256(value)
+
+    @field_validator("elapsed_s", "frame_timestamp_ms")
+    @classmethod
+    def _check_optional_finite_timing(
+        cls, value: float | None, info: ValidationInfo
+    ) -> float | None:
+        if value is not None:
+            return _validate_finite(value, info.field_name or "timing")
+        return None
 
 
 class PlateauResult(StrictModel):
@@ -390,28 +436,438 @@ class PlateauResult(StrictModel):
 
 
 class WatchSpec(StrictModel):
-    """M2 stub: timed transient / stopwatch capture specification."""
+    """Timed transient / stopwatch capture specification for ``sim_watch``."""
 
     readouts: list[str] = Field(min_length=1)
     duration_s: float = Field(gt=0.0)
     interval_ms: int = Field(default=250, ge=10)
     trigger_action: ActionStep | None = None
+    trigger_actions: list[ActionStep] = Field(default_factory=list)
     stop_when_stable_s: float | None = Field(default=None, gt=0.0)
+    stability_tol: float = Field(default=0.0, ge=0.0)
+    stop_readout: str | None = None
+    stop_op: WatchStopOp | None = None
+    stop_value: float | None = None
     fixed_controls: dict[str, float | int | str] = Field(default_factory=dict)
+    max_frames: int = Field(default=500, ge=1, le=2000)
+    blur_before_capture: bool = True
+    settle_ms: int = Field(default=0, ge=0, le=30_000)
+    save_dataset: bool = True
+    dataset_id: str | None = None
+
+    @field_validator("dataset_id")
+    @classmethod
+    def _check_dataset_id(cls, value: str | None) -> str | None:
+        if value is not None:
+            return _validate_dataset_id(value, "WatchSpec.dataset_id")
+        return None
+
+    @model_validator(mode="after")
+    def _check_watch_spec(self) -> WatchSpec:
+        for idx, readout in enumerate(self.readouts):
+            if not readout.strip():
+                raise ValueError(f"WatchSpec.readouts[{idx}] must not be empty or whitespace")
+        if len(set(self.readouts)) != len(self.readouts):
+            raise ValueError(f"WatchSpec.readouts must not contain duplicates; got {self.readouts}")
+
+        _validate_finite(self.duration_s, "WatchSpec.duration_s")
+        _validate_finite(self.stability_tol, "WatchSpec.stability_tol")
+        if self.stop_when_stable_s is not None:
+            _validate_finite(self.stop_when_stable_s, "WatchSpec.stop_when_stable_s")
+        if self.stop_value is not None:
+            _validate_finite(self.stop_value, "WatchSpec.stop_value")
+
+        for ctrl, val in self.fixed_controls.items():
+            if not ctrl.strip():
+                raise ValueError("WatchSpec.fixed_controls keys must not be empty or whitespace")
+            if isinstance(val, float):
+                _validate_finite(val, f"WatchSpec.fixed_controls[{ctrl!r}]")
+
+        if self.trigger_action is not None and self.trigger_actions:
+            raise ValueError(
+                "WatchSpec cannot specify both 'trigger_action' and non-empty 'trigger_actions'"
+            )
+
+        threshold_flags = (
+            self.stop_readout is not None,
+            self.stop_op is not None,
+            self.stop_value is not None,
+        )
+        if any(threshold_flags) and not all(threshold_flags):
+            raise ValueError(
+                "WatchSpec requires 'stop_readout', 'stop_op', and 'stop_value' to all be "
+                "specified together or all omitted"
+            )
+        if self.stop_readout is not None and self.stop_readout not in self.readouts:
+            raise ValueError(
+                f"WatchSpec.stop_readout ({self.stop_readout!r}) must be one of "
+                f"WatchSpec.readouts ({self.readouts!r})"
+            )
+
+        if self.dataset_id is not None and not self.save_dataset:
+            raise ValueError("WatchSpec.dataset_id cannot be set when save_dataset is False")
+
+        return self
+
+
+class WatchResult(StrictModel):
+    """Structured result returned by ``sim_watch`` timed transient capture."""
+
+    status: WatchStatus
+    pacing_mode: WatchPacingMode
+    requested_duration_s: float = Field(gt=0.0)
+    actual_duration_s: float = Field(ge=0.0)
+    interval_ms: int = Field(ge=10)
+    captured_frames: int = Field(ge=0)
+    missing_readouts: int = Field(default=0, ge=0)
+    stop_reason: str
+    readings_relpath: str = Field(min_length=1)
+    dataset_id: str | None = None
+    dataset_relpath: str | None = None
+    points: list[MeasurementPoint] = Field(default_factory=list)
+
+    @field_validator("requested_duration_s", "actual_duration_s")
+    @classmethod
+    def _check_finite_durations(cls, value: float, info: ValidationInfo) -> float:
+        return _validate_finite(value, info.field_name or "duration")
+
+    @field_validator("readings_relpath")
+    @classmethod
+    def _check_readings_relpath(cls, value: str) -> str:
+        return _validate_relpath(value)
+
+    @field_validator("dataset_id")
+    @classmethod
+    def _check_dataset_id(cls, value: str | None) -> str | None:
+        if value is not None:
+            return _validate_dataset_id(value, "WatchResult.dataset_id")
+        return None
+
+    @field_validator("dataset_relpath")
+    @classmethod
+    def _check_dataset_relpath(cls, value: str | None) -> str | None:
+        if value is not None:
+            return _validate_relpath(value)
+        return None
+
+    @model_validator(mode="after")
+    def _check_watch_result(self) -> WatchResult:
+        if self.captured_frames != len(self.points):
+            raise ValueError(
+                f"WatchResult.captured_frames ({self.captured_frames}) must equal "
+                f"len(points) ({len(self.points)})"
+            )
+        if (self.dataset_id is None) != (self.dataset_relpath is None):
+            raise ValueError(
+                "WatchResult requires 'dataset_id' and 'dataset_relpath' to both be "
+                "specified or both omitted"
+            )
+        return self
 
 
 class ComputeSimSpec(StrictModel):
-    """M2 stub: sandboxed numerical/ODE modeling specification tagged ``model_computed``."""
+    """Sandboxed numerical, ODE, and FFT modeling specification tagged ``model_computed``."""
 
-    model_kind: Literal["ode_ivp", "algebraic_grid", "fft_spectrum"]
-    expression: str = Field(min_length=1)
+    model_kind: ComputeModelKind
+    expression: str | None = None
+    expressions: list[str] = Field(default_factory=list)
+    state_variables: list[str] = Field(default_factory=list)
     parameters: dict[str, float] = Field(default_factory=dict)
-    grid_variable: str = Field(min_length=1)
-    grid_start: float
-    grid_stop: float
-    grid_points: int = Field(default=200, ge=2, le=100_000)
+    grid_variable: str = Field(default="t", min_length=1)
+    grid_start: float | None = None
+    grid_stop: float | None = None
+    grid_points: int = Field(default=200, ge=2, le=50_000)
     initial_state: list[float] = Field(default_factory=list)
+    ode_method: OdeMethod = "RK45"
+    rtol: float = Field(default=1e-6, gt=0.0, le=1e-1)
+    atol: float = Field(default=1e-9, gt=0.0, le=1e-1)
+    max_nfev: int = Field(default=50_000, ge=10, le=250_000)
+    timeout_s: float = Field(default=5.0, gt=0.0, le=30.0)
+    input_dataset_id: str | None = None
+    time_column: str | None = None
+    signal_column: str | None = None
+    window: FftWindow = "none"
+    detrend_mean: bool = True
+    dataset_id: str | None = None
+    units: dict[str, str] = Field(default_factory=dict)
+    notes: str = ""
     provenance: Literal["model_computed"] = "model_computed"
+
+    @field_validator("dataset_id", "input_dataset_id")
+    @classmethod
+    def _check_dataset_ids(cls, value: str | None, info: ValidationInfo) -> str | None:
+        if value is not None:
+            return _validate_dataset_id(value, f"ComputeSimSpec.{info.field_name}")
+        return None
+
+    @model_validator(mode="after")
+    def _check_compute_spec(self) -> ComputeSimSpec:
+        _validate_finite(self.rtol, "ComputeSimSpec.rtol")
+        _validate_finite(self.atol, "ComputeSimSpec.atol")
+        _validate_finite(self.timeout_s, "ComputeSimSpec.timeout_s")
+        _validate_identifier(self.grid_variable, "ComputeSimSpec.grid_variable")
+
+        if self.grid_start is not None:
+            _validate_finite(self.grid_start, "ComputeSimSpec.grid_start")
+        if self.grid_stop is not None:
+            _validate_finite(self.grid_stop, "ComputeSimSpec.grid_stop")
+
+        for key, val in self.parameters.items():
+            _validate_identifier(key, f"ComputeSimSpec.parameters[{key!r}]")
+            _validate_finite(val, f"ComputeSimSpec.parameters[{key!r}]")
+
+        for idx, val in enumerate(self.initial_state):
+            _validate_finite(val, f"ComputeSimSpec.initial_state[{idx}]")
+
+        for col_name in self.units:
+            if not col_name.strip():
+                raise ValueError("ComputeSimSpec.units keys must not be empty or whitespace")
+
+        if self.expression is not None and not self.expression.strip():
+            raise ValueError("ComputeSimSpec.expression must not be empty or whitespace")
+        for idx, expr in enumerate(self.expressions):
+            if not expr.strip():
+                raise ValueError(f"ComputeSimSpec.expressions[{idx}] must not be empty")
+        if self.expression is not None and self.expressions:
+            raise ValueError(
+                "ComputeSimSpec cannot specify both 'expression' and non-empty 'expressions'"
+            )
+
+        has_dataset_inputs = any(
+            v is not None for v in (self.input_dataset_id, self.time_column, self.signal_column)
+        )
+
+        if self.model_kind == "ode_ivp":
+            if has_dataset_inputs:
+                raise ValueError(
+                    "input_dataset_id, time_column, and signal_column are only valid for "
+                    "model_kind='fft_spectrum'"
+                )
+            if self.grid_start is None or self.grid_stop is None:
+                raise ValueError("ode_ivp requires both 'grid_start' and 'grid_stop'")
+            if self.grid_stop <= self.grid_start:
+                raise ValueError(
+                    f"ode_ivp requires grid_stop > grid_start; got "
+                    f"({self.grid_start}, {self.grid_stop})"
+                )
+            n_dim = len(self.initial_state)
+            if n_dim == 0:
+                raise ValueError("ode_ivp requires non-empty 'initial_state'")
+            if n_dim > 16:
+                raise ValueError(f"ode_ivp supports at most 16 state variables; got {n_dim}")
+            if self.grid_variable in self.parameters:
+                raise ValueError(
+                    f"grid_variable ({self.grid_variable!r}) must not collide with parameters"
+                )
+
+            should_default_state_vars = False
+            if self.expression is not None:
+                if n_dim != 1:
+                    raise ValueError(
+                        f"ode_ivp with single 'expression' requires len(initial_state) == 1; "
+                        f"got {n_dim}"
+                    )
+                if not self.state_variables:
+                    effective_state_vars = ["y"]
+                    should_default_state_vars = True
+                elif len(self.state_variables) != 1:
+                    raise ValueError(
+                        "ode_ivp with single 'expression' accepts at most one state_variable"
+                    )
+                else:
+                    effective_state_vars = self.state_variables
+            elif self.expressions:
+                if len(self.expressions) != n_dim:
+                    raise ValueError(
+                        f"ode_ivp requires len(expressions) ({len(self.expressions)}) == "
+                        f"len(initial_state) ({n_dim})"
+                    )
+                if len(self.state_variables) != n_dim:
+                    raise ValueError(
+                        f"ode_ivp with 'expressions' requires len(state_variables) "
+                        f"({len(self.state_variables)}) == len(initial_state) ({n_dim})"
+                    )
+                effective_state_vars = self.state_variables
+            else:
+                raise ValueError("ode_ivp requires either 'expression' or 'expressions'")
+
+            seen_vars: set[str] = set()
+            for idx, var in enumerate(effective_state_vars):
+                _validate_identifier(var, f"ComputeSimSpec.state_variables[{idx}]")
+                if var in seen_vars:
+                    raise ValueError(f"Duplicate state variable {var!r} in state_variables")
+                if var == self.grid_variable:
+                    raise ValueError(
+                        f"state_variable {var!r} must be distinct from grid_variable"
+                    )
+                if var in self.parameters:
+                    raise ValueError(
+                        f"state_variable {var!r} must be distinct from parameters"
+                    )
+                seen_vars.add(var)
+
+            if should_default_state_vars:
+                object.__setattr__(self, "state_variables", ["y"])
+
+        elif self.model_kind == "algebraic_grid":
+            if has_dataset_inputs:
+                raise ValueError(
+                    "input_dataset_id, time_column, and signal_column are only valid for "
+                    "model_kind='fft_spectrum'"
+                )
+            if self.initial_state:
+                raise ValueError("initial_state is only valid for model_kind='ode_ivp'")
+            if self.grid_start is None or self.grid_stop is None:
+                raise ValueError("algebraic_grid requires both 'grid_start' and 'grid_stop'")
+            if self.grid_stop == self.grid_start:
+                raise ValueError(
+                    f"algebraic_grid requires grid_stop != grid_start; got {self.grid_start}"
+                )
+            if self.grid_variable in self.parameters:
+                raise ValueError(
+                    f"grid_variable ({self.grid_variable!r}) must not collide with parameters"
+                )
+
+            if self.expression is not None:
+                if len(self.state_variables) > 1:
+                    raise ValueError(
+                        "algebraic_grid with single 'expression' accepts at most one state_variable"
+                    )
+                output_cols = self.state_variables if self.state_variables else ["y"]
+            elif self.expressions:
+                if len(self.expressions) > 16:
+                    raise ValueError(
+                        f"algebraic_grid supports at most 16 expressions; got "
+                        f"{len(self.expressions)}"
+                    )
+                if len(self.state_variables) != len(self.expressions):
+                    raise ValueError(
+                        f"algebraic_grid with 'expressions' requires len(state_variables) "
+                        f"({len(self.state_variables)}) == len(expressions) "
+                        f"({len(self.expressions)})"
+                    )
+                output_cols = self.state_variables
+            else:
+                raise ValueError("algebraic_grid requires either 'expression' or 'expressions'")
+
+            seen_cols: set[str] = set()
+            for idx, col in enumerate(output_cols):
+                _validate_identifier(col, f"ComputeSimSpec.state_variables[{idx}]")
+                if col in seen_cols:
+                    raise ValueError(f"Duplicate output column {col!r} in state_variables")
+                if col == self.grid_variable:
+                    raise ValueError(
+                        f"Output column {col!r} must be distinct from grid_variable"
+                    )
+                seen_cols.add(col)
+
+        elif self.model_kind == "fft_spectrum":
+            if self.initial_state:
+                raise ValueError("initial_state is only valid for model_kind='ode_ivp'")
+            if self.state_variables:
+                raise ValueError(
+                    "state_variables is not valid for model_kind='fft_spectrum'"
+                )
+            if has_dataset_inputs:
+                if (
+                    not (self.input_dataset_id and self.input_dataset_id.strip())
+                    or not (self.time_column and self.time_column.strip())
+                    or not (self.signal_column and self.signal_column.strip())
+                ):
+                    raise ValueError(
+                        "Dataset-backed fft_spectrum requires non-empty 'input_dataset_id', "
+                        "'time_column', and 'signal_column'"
+                    )
+                if self.expression is not None or self.expressions:
+                    raise ValueError(
+                        "Dataset-backed fft_spectrum must not specify 'expression' or 'expressions'"
+                    )
+                if self.grid_start is not None or self.grid_stop is not None:
+                    raise ValueError(
+                        "Dataset-backed fft_spectrum must not specify 'grid_start' or 'grid_stop'"
+                    )
+                if self.parameters:
+                    raise ValueError(
+                        "Dataset-backed fft_spectrum must not specify 'parameters'"
+                    )
+            else:
+                if self.expressions:
+                    raise ValueError(
+                        "Inline fft_spectrum requires a single 'expression', not 'expressions'"
+                    )
+                if self.expression is None:
+                    raise ValueError(
+                        "fft_spectrum requires either dataset inputs "
+                        "('input_dataset_id', 'time_column', 'signal_column') or inline "
+                        "'expression' with 'grid_start' and 'grid_stop'"
+                    )
+                if self.grid_start is None or self.grid_stop is None:
+                    raise ValueError(
+                        "Inline fft_spectrum requires both 'grid_start' and 'grid_stop'"
+                    )
+                if self.grid_stop <= self.grid_start:
+                    raise ValueError(
+                        f"Inline fft_spectrum requires grid_stop > grid_start; got "
+                        f"({self.grid_start}, {self.grid_stop})"
+                    )
+                if self.grid_points < 4:
+                    raise ValueError(
+                        f"Inline fft_spectrum requires grid_points >= 4; got {self.grid_points}"
+                    )
+                if self.grid_variable in self.parameters:
+                    raise ValueError(
+                        f"grid_variable ({self.grid_variable!r}) must not collide with parameters"
+                    )
+
+        return self
+
+
+class ComputeSimResult(StrictModel):
+    """Structured output returned by ``compute_sim``, unconditionally tagged ``model_computed``."""
+
+    model_kind: ComputeModelKind
+    provenance: Literal["model_computed"] = "model_computed"
+    dataset_id: str = Field(min_length=1)
+    dataset_relpath: str = Field(min_length=1)
+    dataset_sha256: str
+    row_count: int = Field(ge=0)
+    columns: list[str] = Field(min_length=1)
+    units: dict[str, str] = Field(default_factory=dict)
+    solver_meta: dict[str, Any] = Field(default_factory=dict)
+    preview_rows: list[dict[str, Any]] = Field(default_factory=list)
+
+    @field_validator("dataset_id")
+    @classmethod
+    def _check_dataset_id(cls, value: str) -> str:
+        return _validate_dataset_id(value, "ComputeSimResult.dataset_id")
+
+    @field_validator("dataset_relpath")
+    @classmethod
+    def _check_dataset_relpath(cls, value: str) -> str:
+        return _validate_relpath(value)
+
+    @field_validator("dataset_sha256")
+    @classmethod
+    def _check_dataset_sha256(cls, value: str) -> str:
+        return _validate_sha256(value)
+
+    @model_validator(mode="after")
+    def _check_compute_result(self) -> ComputeSimResult:
+        for idx, col in enumerate(self.columns):
+            if not col.strip():
+                raise ValueError(
+                    f"ComputeSimResult.columns[{idx}] must not be empty or whitespace"
+                )
+        if len(set(self.columns)) != len(self.columns):
+            raise ValueError(
+                f"ComputeSimResult.columns must not contain duplicates; got {self.columns}"
+            )
+        if len(self.preview_rows) > self.row_count:
+            raise ValueError(
+                f"ComputeSimResult len(preview_rows) ({len(self.preview_rows)}) "
+                f"cannot exceed row_count ({self.row_count})"
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -725,6 +1181,8 @@ __all__ = [
     "CommitMode",
     "ComparisonOutput",
     "ComparisonSpec",
+    "ComputeModelKind",
+    "ComputeSimResult",
     "ComputeSimSpec",
     "ControlKind",
     "ControlSpec",
@@ -732,11 +1190,13 @@ __all__ = [
     "DerivedColumnSpec",
     "DiagramElement",
     "DiagramSpec",
+    "FftWindow",
     "MeasurementPoint",
     "OcrBackendKind",
     "OcrBox",
     "OcrMode",
     "OcrResult",
+    "OdeMethod",
     "ParseMode",
     "PlateauResult",
     "PlotSeries",
@@ -765,5 +1225,9 @@ __all__ = [
     "SweepSpec",
     "SwfMeta",
     "TERMINAL_RUN_PHASES",
+    "WatchPacingMode",
+    "WatchResult",
     "WatchSpec",
+    "WatchStatus",
+    "WatchStopOp",
 ]

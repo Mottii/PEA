@@ -6,6 +6,8 @@ import asyncio
 import http.client
 import io
 import json
+import math
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -14,20 +16,25 @@ import httpx
 import pytest
 from PIL import Image
 
-from pea.config import PeaConfig
+from pea.config import PathConfinementError, PeaConfig
+from pea.math_engine import data_analyze
 from pea.ocr.base import read_spec_with_backend
 from pea.schemas import (
     ActionStep,
     CalibrationProfile,
+    ComputeSimResult,
     ComputeSimSpec,
     ControlSpec,
+    DerivedColumnSpec,
     OcrBox,
     OcrMode,
     OcrResult,
     ReadoutSpec,
+    RegressionSpec,
     SearchSpec,
     SweepAxis,
     SweepSpec,
+    WatchResult,
     WatchSpec,
 )
 from pea.sim import (
@@ -36,8 +43,10 @@ from pea.sim import (
     SimRuntimeServer,
     SimulatorManager,
     SimulatorSession,
+    compute_html5_dir_sha256,
     compute_sim,
     compute_stepper_plan,
+    compute_url_sha256,
     format_control_value,
     select_all_shortcut,
     sim_watch,
@@ -1208,17 +1217,1388 @@ async def test_session_edge_cases_retry_failure_cancel_and_control_type(tmp_path
     assert verify_conc.ok is True, f"Concurrent provenance errors: {verify_conc.errors}"
 
 
-async def test_milestone2_protocol_stubs_raise_not_implemented() -> None:
-    watch_spec = WatchSpec(readouts=["voltage_c"], duration_s=5.0, interval_ms=200)
-    with pytest.raises(NotImplementedError, match="Milestone 2"):
-        await sim_watch(watch_spec)
+# ---------------------------------------------------------------------------
+# 5. M2B — HTML5/URL Fingerprinting & sim_watch Timed Transient Capture
+# ---------------------------------------------------------------------------
 
+
+def _build_transient_profile(sha256: str = SAMPLE_SHA256) -> CalibrationProfile:
+    return CalibrationProfile(
+        swf_sha256=sha256,
+        stage_width=800,
+        stage_height=600,
+        header_height_px=39,
+        controls={
+            "R": ControlSpec(
+                name="R",
+                kind="stepper",
+                input_xy=(120, 120),
+                step=0.5,
+                min_val=1.0,
+                max_val=50.0,
+                commit_mode="enter",
+            ),
+            "reset": ControlSpec(
+                name="reset",
+                kind="button",
+                click_xy=(220, 120),
+                commit_mode="click",
+            ),
+            "start": ControlSpec(
+                name="start",
+                kind="button",
+                click_xy=(320, 120),
+                commit_mode="click",
+            ),
+        },
+        readouts={
+            "Vc": ReadoutSpec(
+                name="Vc",
+                roi_px=(100, 200, 260, 240),
+                ocr_mode="rec_only",
+                parse_mode="float",
+                unit_pattern=r"V",
+            ),
+            "t_sim": ReadoutSpec(
+                name="t_sim",
+                roi_px=(300, 200, 460, 240),
+                ocr_mode="rec_only",
+                parse_mode="float",
+                unit_pattern=r"s",
+            ),
+        },
+        blur_xy=(450, 18),
+    )
+
+
+class _TransientMockOcrBackend:
+    """Pixel-indexed mock OCR decoding historical frame state (supports burst_post_ocr)."""
+
+    def __init__(
+        self,
+        frame_texts: dict[int, dict[str, str]],
+        *,
+        ocr_delay_s: float = 0.0,
+    ) -> None:
+        self._frame_texts = frame_texts
+        self._ocr_delay_s = ocr_delay_s
+        self.read_calls: list[tuple[int, str]] = []
+
+    @property
+    def backend_name(self) -> str:
+        return "rapidocr"
+
+    def recognize(self, image: object, *, mode: OcrMode = "det_rec") -> OcrResult:
+        return OcrResult(backend="rapidocr", mode=mode, elapsed_ms=0.1, boxes=[])
+
+    def read_spec(
+        self,
+        image: Image.Image,
+        spec: ReadoutSpec,
+    ) -> tuple[OcrResult, float | int | str | None, str | None]:
+        if self._ocr_delay_s > 0:
+            time.sleep(self._ocr_delay_s)
+        px = image.getpixel((0, 0))
+        assert isinstance(px, tuple)
+        shot_num = int(px[0]) + 255 * int(px[1])
+        self.read_calls.append((shot_num, spec.name))
+        txt = self._frame_texts.get(shot_num, {}).get(spec.name, "")
+
+        class _SingleTextBackend:
+            backend_name = "rapidocr"
+
+            def recognize(self, crop: object, *, mode: OcrMode = "det_rec") -> OcrResult:
+                boxes = (
+                    [
+                        OcrBox(
+                            text=txt,
+                            confidence=0.99,
+                            bbox_px=(0, 0, 40, 20),
+                            bbox_norm=(0.0, 0.0, 1.0, 1.0),
+                        )
+                    ]
+                    if txt
+                    else []
+                )
+                return OcrResult(backend="rapidocr", mode=mode, elapsed_ms=0.1, boxes=boxes)
+
+            def read_spec(self, img: object, s: ReadoutSpec) -> tuple[OcrResult, Any, Any]:
+                return read_spec_with_backend(self, img, s)  # type: ignore[arg-type]
+
+        return read_spec_with_backend(_SingleTextBackend(), image, spec)  # type: ignore[arg-type]
+
+
+def test_compute_html5_dir_sha256_determinism_confinement_and_errors(tmp_path: Path) -> None:
+    dir_a = tmp_path / "sim_a"
+    dir_b = tmp_path / "sim_b"
+    for root in (dir_a, dir_b):
+        (root / "js").mkdir(parents=True)
+        (root / "index.html").write_text("<h1>RC Sim</h1>", encoding="utf-8")
+        (root / "js" / "app.js").write_text("console.log(42);", encoding="utf-8")
+
+    sha_a = compute_html5_dir_sha256(dir_a)
+    sha_b = compute_html5_dir_sha256(dir_b)
+    assert len(sha_a) == 64
+    assert sha_a == sha_b
+
+    # Content modification changes digest
+    (dir_b / "js" / "app.js").write_text("console.log(43);", encoding="utf-8")
+    assert compute_html5_dir_sha256(dir_b) != sha_a
+
+    # Filename / path rename changes digest even with identical bytes
+    dir_c = tmp_path / "sim_c"
+    (dir_c / "js").mkdir(parents=True)
+    (dir_c / "index.html").write_text("<h1>RC Sim</h1>", encoding="utf-8")
+    (dir_c / "js" / "main.js").write_text("console.log(42);", encoding="utf-8")
+    assert compute_html5_dir_sha256(dir_c) != sha_a
+
+    # Confined internal symlink resolves cleanly and deterministically
+    dir_sym = tmp_path / "sim_sym"
+    dir_sym.mkdir()
+    target_file = dir_sym / "real.txt"
+    target_file.write_text("confined-data", encoding="utf-8")
+    (dir_sym / "alias.txt").symlink_to(target_file)
+    sha_sym = compute_html5_dir_sha256(dir_sym)
+    assert len(sha_sym) == 64
+    assert sha_sym == compute_html5_dir_sha256(dir_sym)
+
+    # Escaping file symlink raises PathConfinementError
+    outside_secret = tmp_path / "outside.txt"
+    outside_secret.write_text("secret", encoding="utf-8")
+    dir_escape = tmp_path / "sim_escape"
+    dir_escape.mkdir()
+    (dir_escape / "index.html").write_text("ok", encoding="utf-8")
+    (dir_escape / "leak.txt").symlink_to(outside_secret)
+    with pytest.raises(PathConfinementError):
+        compute_html5_dir_sha256(dir_escape)
+
+    # Escaping directory symlink raises PathConfinementError
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir()
+    dir_escape_sub = tmp_path / "sim_escape_sub"
+    dir_escape_sub.mkdir()
+    (dir_escape_sub / "index.html").write_text("ok", encoding="utf-8")
+    (dir_escape_sub / "linked_out").symlink_to(outside_dir)
+    with pytest.raises(PathConfinementError):
+        compute_html5_dir_sha256(dir_escape_sub)
+
+    # Empty directory (or only empty subdirs) raises ValueError
+    empty_dir = tmp_path / "empty_dir"
+    (empty_dir / "nested").mkdir(parents=True)
+    with pytest.raises(ValueError, match="no files"):
+        compute_html5_dir_sha256(empty_dir)
+
+    # Missing path and non-directory file raise FileNotFoundError
+    with pytest.raises(FileNotFoundError):
+        compute_html5_dir_sha256(tmp_path / "does_not_exist")
+    with pytest.raises(FileNotFoundError):
+        compute_html5_dir_sha256(outside_secret)
+
+    # Broken internal symlink raises FileNotFoundError (fails closed)
+    dir_broken = tmp_path / "sim_broken_sym"
+    dir_broken.mkdir()
+    (dir_broken / "index.html").write_text("ok", encoding="utf-8")
+    (dir_broken / "dangling.js").symlink_to(dir_broken / "missing_target.js")
+    with pytest.raises(FileNotFoundError):
+        compute_html5_dir_sha256(dir_broken)
+
+
+def test_compute_url_sha256_canonicalization_and_validation() -> None:
+    base = compute_url_sha256("https://phet.colorado.edu/")
+    assert len(base) == 64
+    assert compute_url_sha256("HTTPS://PhET.Colorado.EDU:443") == base
+    assert compute_url_sha256("https://phet.colorado.edu/#fragment") == base
+    assert compute_url_sha256("  https://phet.colorado.edu:443/#other ") == base
+
+    http_base = compute_url_sha256("http://example.org/sim")
+    assert compute_url_sha256("HTTP://EXAMPLE.ORG:80/sim#top") == http_base
+    assert compute_url_sha256("http://example.org:8080/sim") != http_base
+    assert compute_url_sha256("http://example.org/sim?mode=rc") != http_base
+    assert compute_url_sha256("http://example.org/sim?mode=rlc") != compute_url_sha256(
+        "http://example.org/sim?mode=rc"
+    )
+    assert compute_url_sha256("http://example.org/other") != http_base
+
+    # IPv6 bracketing and default port stripping
+    v6 = compute_url_sha256("http://[::1]/app")
+    assert compute_url_sha256("http://[::1]:80/app#sec") == v6
+    assert compute_url_sha256("http://[::1]:8080/app") != v6
+
+    for bad_url in (
+        "",
+        "   ",
+        "file:///etc/passwd",
+        "ftp://example.com/sim",
+        "javascript:alert(1)",
+        "https:///no-host",
+        "https://user:pass@example.com/sim",
+        "https://example.com/has space",
+    ):
+        with pytest.raises(ValueError):
+            compute_url_sha256(bad_url)
+
+
+async def test_html5_and_url_session_save_profile_sha256_verification(tmp_path: Path) -> None:
+    html5_dir = tmp_path / "html5_app"
+    html5_dir.mkdir()
+    (html5_dir / "index.html").write_text("<div id='sim'>ok</div>", encoding="utf-8")
+    html5_sha = compute_html5_dir_sha256(html5_dir)
+
+    profile = _build_transient_profile(sha256=html5_sha)
+    frame_texts = {1: {"Vc": "10.00 V", "t_sim": "0.00 s"}}
+    page = _MockSimPage(
+        initial_state={"R": 10.0},
+        profile=profile,
+        readout_fn=lambda _n, _st: "10.00 V",
+    )
+    ocr = _TransientMockOcrBackend(frame_texts)
+    cfg = PeaConfig(
+        project_root=REPO_ROOT,
+        local_assets_dir=REPO_ROOT / "local_assets",
+        runs_dir=tmp_path / "runs",
+        profiles_dir=tmp_path / "profiles",
+    )
+    ws = WorkspaceManager.from_config(cfg).create_run(source="simulator_captured")
+    store = ProfileStore.from_config(cfg)
+
+    session = SimulatorSession(
+        session_id="sim-html5-01",
+        config=cfg,
+        workspace=ws,
+        ocr=ocr,  # type: ignore[arg-type]
+        profile_store=store,
+        page=page,
+        target_url="http://127.0.0.1:50001/",
+        loopback_origin="http://127.0.0.1:50001",
+        stage_width=800,
+        stage_height=600,
+        header_height_px=39,
+        swf_meta=None,
+        sim_sha256=html5_sha,
+        platform_name="darwin",
+    )
+
+    # Matching sim_sha256 succeeds
+    saved = await session.save_profile(profile, verify_live=True)
+    assert saved["swf_sha256"] == html5_sha
+    assert Path(saved["saved_path"]).is_file()
+
+    # Mismatched swf_sha256 is rejected even when swf_meta is None
+    wrong_profile = profile.model_copy(update={"swf_sha256": "a" * 64})
+    with pytest.raises(ValueError, match="does not match loaded simulator"):
+        await session.save_profile(wrong_profile, verify_live=False)
+
+    # SimulatorManager.open(url=...) computes sim_sha256 and auto-loads matching saved profile
+    url = "https://phet.colorado.edu/sims/html/rc/index.html"
+    url_sha = compute_url_sha256(url)
+    url_profile = CalibrationProfile(
+        swf_sha256=url_sha,
+        stage_width=1024,
+        stage_height=768,
+        header_height_px=0,
+        readouts={
+            "Vc": ReadoutSpec(
+                name="Vc",
+                roi_px=(10, 10, 100, 40),
+                ocr_mode="rec_only",
+                parse_mode="float",
+            )
+        },
+    )
+    cfg_url = PeaConfig(
+        project_root=REPO_ROOT,
+        local_assets_dir=REPO_ROOT / "local_assets",
+        runs_dir=tmp_path / "runs_url",
+        profiles_dir=tmp_path / "profiles_url",
+        allowed_origins=("https://phet.colorado.edu",),
+    )
+    url_store = ProfileStore.from_config(cfg_url)
+    url_store.save(url_profile, expected_stage=(1024, 768))
+
+    class _FakePage:
+        async def route(self, _pattern: str, _handler: Any) -> None:
+            return
+
+        def on(self, _event: str, _handler: Any) -> None:
+            return
+
+        async def goto(self, _target: str, *, wait_until: str = "domcontentloaded") -> None:
+            return
+
+        async def wait_for_timeout(self, _ms: int) -> None:
+            return
+
+        async def close(self) -> None:
+            return
+
+    class _FakeContext:
+        async def new_page(self) -> _FakePage:
+            return _FakePage()
+
+        async def close(self) -> None:
+            return
+
+    class _FakeBrowser:
+        async def new_context(self, **_kwargs: Any) -> _FakeContext:
+            return _FakeContext()
+
+    mgr = SimulatorManager(cfg_url, profile_store=url_store, ocr=ocr)  # type: ignore[arg-type]
+
+    async def _fake_ensure_browser() -> _FakeBrowser:
+        return _FakeBrowser()
+
+    mgr._ensure_browser = _fake_ensure_browser  # type: ignore[method-assign]
+    opened = await mgr.open(url=url, settle_ms=0)
+    try:
+        assert opened.sim_sha256 == url_sha
+        assert opened.profile is not None
+        assert opened.profile.swf_sha256 == url_sha
+    finally:
+        await mgr.close_session(opened.session_id)
+
+
+async def test_sim_watch_burst_post_ocr_happy_path_and_data_analyze_handoff(
+    tmp_path: Path,
+) -> None:
+    profile = _build_transient_profile()
+    frame_texts: dict[int, dict[str, str]] = {}
+    t_start: list[float] = []
+
+    def _record_rc_frame(shot_num: int) -> None:
+        now = time.perf_counter()
+        if not t_start:
+            t_start.append(now)
+        dt = max(0.0, now - t_start[0])
+        vc = 10.0 * math.exp(-dt / 1.0)
+        frame_texts[shot_num] = {"Vc": f"{vc:.4f} V", "t_sim": f"{dt:.4f} s"}
+
+    page = _MockSimPage(
+        initial_state={"R": 10.0},
+        profile=profile,
+        readout_fn=lambda _n, _st: "10.00 V",
+        on_screenshot_hook=_record_rc_frame,
+    )
+    # Add 15ms per-readout OCR latency to prove actual_duration_s excludes post-OCR time!
+    ocr = _TransientMockOcrBackend(frame_texts, ocr_delay_s=0.015)
+    session = _make_session(tmp_path, profile=profile, page=page, ocr=ocr)  # type: ignore[arg-type]
+
+    spec = WatchSpec(
+        readouts=["Vc", "t_sim"],
+        duration_s=0.10,
+        interval_ms=25,
+        save_dataset=True,
+    )
+    res = await session.watch(spec)
+    assert isinstance(res, WatchResult)
+    assert res.pacing_mode == "burst_post_ocr"
+    assert res.status == "complete"
+    assert res.captured_frames == len(res.points)
+    assert res.captured_frames >= 3
+    assert res.missing_readouts == 0
+    # actual_duration_s must reflect capture loop (~0.10s), NOT post-OCR (which adds >0.1s)
+    assert res.actual_duration_s < 0.25
+    assert res.readings_relpath.startswith("readings/watch-")
+    assert res.dataset_id == "watch-0001"
+    assert res.dataset_relpath == "datasets/watch-0001.json"
+
+    # Monotonic timing and unique hashed evidence frames
+    elapsed_vals = [pt.elapsed_s for pt in res.points]
+    assert all(e is not None and e >= 0.0 for e in elapsed_vals)
+    assert elapsed_vals == sorted(elapsed_vals)  # type: ignore[type-var]
+    for pt in res.points:
+        assert pt.elapsed_s is not None
+        assert pt.frame_timestamp_ms == pytest.approx(pt.elapsed_s * 1000.0)
+        assert pt.screenshot_relpath.startswith("evidence/watch-")
+        assert pt.readout_units["Vc"] == "V"
+        assert pt.readout_units["t_sim"] == "s"
+    assert len({pt.screenshot_relpath for pt in res.points}) == res.captured_frames
+    assert len({pt.screenshot_sha256 for pt in res.points}) == res.captured_frames
+
+    # Status metadata updated with latest screenshot
+    status = session.workspace.read_status()
+    assert status.phase == "complete"
+    assert status.metadata["latest_screenshot_relpath"] == res.points[-1].screenshot_relpath
+
+    # Dataset handoff into data_analyze recovers exponential RC decay cleanly
+    analysis = data_analyze(
+        res.dataset_id,
+        session.workspace,
+        derived_columns=[DerivedColumnSpec(name="ln_vc", formula="log(Vc)")],
+        regressions=[
+            RegressionSpec(name="rc_decay", x_column="elapsed_s", y_column="ln_vc")
+        ],
+    )
+    assert analysis.source == "simulator_captured"
+    assert analysis.row_count == res.captured_frames
+    assert analysis.regressions[0].r_squared > 0.99
+    assert analysis.regressions[0].slope == pytest.approx(-1.0, rel=0.15)
+
+    # Consecutive watch call auto-increments dataset ID without collision
+    res2 = await session.watch(
+        WatchSpec(readouts=["Vc"], duration_s=0.05, interval_ms=25, save_dataset=True)
+    )
+    assert res2.dataset_id == "watch-0002"
+    assert res2.dataset_relpath == "datasets/watch-0002.json"
+
+    # Explicit colliding dataset_id fails fast BEFORE touching the simulator page
+    shots_before = page.screenshot_count
+    with pytest.raises(FileExistsError, match="already exists"):
+        await session.watch(
+            WatchSpec(
+                readouts=["Vc"],
+                duration_s=0.05,
+                interval_ms=25,
+                save_dataset=True,
+                dataset_id="watch-0001",
+            )
+        )
+    assert page.screenshot_count == shots_before
+    assert session.workspace.verify_provenance().ok is True
+
+
+async def test_sim_watch_inline_ocr_stability_stop_and_ocr_miss_anchor_reset(
+    tmp_path: Path,
+) -> None:
+    profile = _build_transient_profile()
+    # Shots 1..3 settle to 1.00 V; shot 4 is 1.00 V; shot 5 is an OCR miss ("");
+    # shots 6..12 stay at 1.00 V (+/- 0.01). The OCR miss MUST reset the stability anchor!
+    seq_values = [
+        "10.00 V",
+        "5.00 V",
+        "1.00 V",
+        "1.00 V",
+        "",  # Shot 5: OCR miss -> resets stability anchor!
+        "1.00 V",  # Shot 6: re-anchors (valid_count=1)
+        "1.01 V",  # Shot 7: valid_count=2
+        "0.99 V",  # Shot 8: valid_count=3
+        "1.00 V",  # Shot 9: valid_count=4
+        "1.00 V",  # Shot 10
+        "1.00 V",  # Shot 11
+        "1.00 V",  # Shot 12
+    ]
+    frame_texts = {idx + 1: {"Vc": val} for idx, val in enumerate(seq_values)}
+    page = _MockSimPage(
+        initial_state={"R": 10.0},
+        profile=profile,
+        readout_fn=lambda _n, _st: "1.00 V",
+    )
+    ocr = _TransientMockOcrBackend(frame_texts)
+    session = _make_session(tmp_path, profile=profile, page=page, ocr=ocr)  # type: ignore[arg-type]
+
+    res = await session.watch(
+        WatchSpec(
+            readouts=["Vc"],
+            duration_s=2.0,
+            interval_ms=25,
+            stop_when_stable_s=0.06,
+            stability_tol=0.02,
+            save_dataset=True,
+        )
+    )
+    assert res.pacing_mode == "inline_ocr"
+    assert res.status == "stopped_stable"
+    assert res.missing_readouts == 1
+    # Shot 5 (index 4) MUST remain None (zero fabrication) and stability must require
+    # frames AFTER index 4 spanning >= 0.06s (so index >= 7, i.e., >= 8 frames).
+    assert res.points[4].parsed_value is None
+    assert res.points[4].readouts["Vc"] is None
+    assert res.captured_frames >= 8
+    anchor_t = res.points[5].elapsed_s
+    final_t = res.points[-1].elapsed_s
+    assert anchor_t is not None and final_t is not None
+    assert (final_t - anchor_t) >= 0.06 - 1e-6
+    assert session.workspace.verify_provenance().ok is True
+
+
+@pytest.mark.parametrize(
+    ("stop_op", "stop_value", "sequence", "expected_frames"),
+    [
+        ("le", 2.0, ["", "5.0 V", "2.0 V", "1.0 V"], 3),
+        ("lt", 2.0, ["", "5.0 V", "2.0 V", "1.9 V", "1.0 V"], 4),
+        ("ge", 8.0, ["", "5.0 V", "8.0 V", "9.0 V"], 3),
+        ("gt", 8.0, ["", "5.0 V", "8.0 V", "8.1 V", "9.0 V"], 4),
+    ],
+)
+async def test_sim_watch_inline_ocr_threshold_stop_operators_and_miss_guard(
+    tmp_path: Path,
+    stop_op: str,
+    stop_value: float,
+    sequence: list[str],
+    expected_frames: int,
+) -> None:
+    profile = _build_transient_profile()
+    frame_texts = {idx + 1: {"Vc": val} for idx, val in enumerate(sequence)}
+    page = _MockSimPage(
+        initial_state={"R": 10.0},
+        profile=profile,
+        readout_fn=lambda _n, _st: "0.0 V",
+    )
+    ocr = _TransientMockOcrBackend(frame_texts)
+    session = _make_session(
+        tmp_path / f"thr_{stop_op}",
+        profile=profile,
+        page=page,
+        ocr=ocr,  # type: ignore[arg-type]
+    )
+
+    res = await session.watch(
+        WatchSpec(
+            readouts=["Vc"],
+            duration_s=2.0,
+            interval_ms=15,
+            stop_readout="Vc",
+            stop_op=stop_op,  # type: ignore[arg-type]
+            stop_value=stop_value,
+            save_dataset=False,
+        )
+    )
+    assert res.pacing_mode == "inline_ocr"
+    assert res.status == "stopped_threshold"
+    assert res.captured_frames == expected_frames
+    assert res.missing_readouts == 1  # Leading OCR miss did NOT falsely trigger stop
+    assert res.points[0].parsed_value is None
+    assert session.workspace.verify_provenance().ok is True
+
+
+async def test_sim_watch_setup_trigger_actions_settle_and_blur_ordering(tmp_path: Path) -> None:
+    profile = _build_transient_profile()
+    timeline: list[Any] = []
+
+    def _on_shot(shot_num: int) -> None:
+        timeline.append(("screenshot", shot_num))
+
+    page = _MockSimPage(
+        initial_state={"R": 2.0},
+        profile=profile,
+        readout_fn=lambda _n, _st: "10.0 V",
+        on_screenshot_hook=_on_shot,
+    )
+    orig_click = page.on_click
+    orig_wait = page.wait_for_timeout
+
+    def _traced_click(x: int, y: int) -> None:
+        timeline.append(("click", x, y))
+        orig_click(x, y)
+
+    async def _traced_wait(ms: int) -> None:
+        timeline.append(("wait", ms))
+        await orig_wait(ms)
+
+    page.on_click = _traced_click  # type: ignore[method-assign]
+    page.wait_for_timeout = _traced_wait  # type: ignore[method-assign]
+
+    frame_texts = {i: {"Vc": "10.0 V"} for i in range(1, 10)}
+    ocr = _TransientMockOcrBackend(frame_texts)
+    session = _make_session(tmp_path, profile=profile, page=page, ocr=ocr)  # type: ignore[arg-type]
+
+    res = await session.watch(
+        WatchSpec(
+            fixed_controls={"R": 5.0},
+            settle_ms=15,
+            blur_before_capture=True,
+            trigger_actions=[
+                ActionStep(action="click", control="reset"),
+                ActionStep(action="click", control="start"),
+            ],
+            readouts=["Vc"],
+            duration_s=0.05,
+            interval_ms=25,
+            max_frames=2,
+            save_dataset=False,
+        )
+    )
+    assert res.captured_frames == 2
+    assert page.state["R"] == pytest.approx(5.0)
+
+    # Verify strict order: fixed_control R -> wait(15) -> blur(450, 18) -> reset -> start -> shot 1
+    idx_wait = timeline.index(("wait", 15))
+    idx_blur = timeline.index(("click", 450, 18), idx_wait)
+    idx_reset = timeline.index(("click", 220, 120), idx_blur)
+    idx_start = timeline.index(("click", 320, 120), idx_reset)
+    idx_shot1 = timeline.index(("screenshot", 1), idx_start)
+    assert idx_wait < idx_blur < idx_reset < idx_start < idx_shot1
+
+    # Pre-flight validation rejects unknown fixed_controls, readouts, or trigger controls
+    shots_before = page.screenshot_count
+    with pytest.raises(KeyError, match="Fixed control"):
+        await session.watch(
+            WatchSpec(fixed_controls={"NOPE": 1}, readouts=["Vc"], duration_s=0.1, interval_ms=20)
+        )
+    with pytest.raises(KeyError, match="Readout"):
+        await session.watch(WatchSpec(readouts=["NOPE"], duration_s=0.1, interval_ms=20))
+    with pytest.raises(KeyError, match="Trigger control"):
+        await session.watch(
+            WatchSpec(
+                readouts=["Vc"],
+                duration_s=0.1,
+                interval_ms=20,
+                trigger_action=ActionStep(action="click", control="NOPE"),
+            )
+        )
+    assert page.screenshot_count == shots_before
+
+
+async def test_sim_watch_max_frames_cap_and_save_dataset_false(tmp_path: Path) -> None:
+    profile = _build_transient_profile()
+    frame_texts = {i: {"Vc": f"{10.0 - i:.2f} V"} for i in range(1, 20)}
+    page = _MockSimPage(
+        initial_state={"R": 10.0},
+        profile=profile,
+        readout_fn=lambda _n, _st: "5.0 V",
+    )
+    ocr = _TransientMockOcrBackend(frame_texts)
+    session = _make_session(tmp_path, profile=profile, page=page, ocr=ocr)  # type: ignore[arg-type]
+
+    res = await session.watch(
+        WatchSpec(
+            readouts=["Vc"],
+            duration_s=5.0,
+            interval_ms=15,
+            max_frames=3,
+            save_dataset=False,
+        )
+    )
+    assert res.status == "max_frames_reached"
+    assert res.captured_frames == 3
+    assert len(res.points) == 3
+    assert res.dataset_id is None
+    assert res.dataset_relpath is None
+    assert not (session.workspace.root / "datasets").exists()
+    assert session.workspace.verify_provenance().ok is True
+
+
+async def test_sim_watch_cooperative_cancel_task_cancel_and_mid_burst_error_recovery(
+    tmp_path: Path,
+) -> None:
+    profile = _build_transient_profile()
+    frame_texts = {i: {"Vc": f"{10.0 - 0.5 * i:.2f} V"} for i in range(1, 30)}
+
+    # (a) Cooperative request_cancel() wakes immediately during a long 5000ms interval
+    page_coop = _MockSimPage(
+        initial_state={"R": 10.0},
+        profile=profile,
+        readout_fn=lambda _n, _st: "9.0 V",
+    )
+    sess_coop = _make_session(
+        tmp_path / "coop_cancel",
+        profile=profile,
+        page=page_coop,
+        ocr=_TransientMockOcrBackend(frame_texts),  # type: ignore[arg-type]
+    )
+
+    async def _trigger_cancel_soon() -> None:
+        await asyncio.sleep(0.04)
+        sess_coop.request_cancel()
+
+    t_wall0 = time.perf_counter()
+    cancel_task = asyncio.create_task(_trigger_cancel_soon())
+    res_coop = await sess_coop.watch(
+        WatchSpec(
+            readouts=["Vc"],
+            duration_s=10.0,
+            interval_ms=5000,
+            save_dataset=True,
+        )
+    )
+    await cancel_task
+    wall_elapsed = time.perf_counter() - t_wall0
+    assert wall_elapsed < 1.0  # Woke immediately instead of waiting 5s
+    assert res_coop.status == "cancelled"
+    assert res_coop.captured_frames == 1
+    assert res_coop.dataset_id == "watch-0001"
+    assert sess_coop.workspace.read_status().phase == "cancelled"
+    assert sess_coop.workspace.verify_provenance().ok is True
+
+    # (b) External asyncio.Task.cancel() during burst_post_ocr flushes buffered PNGs
+    page_ext = _MockSimPage(
+        initial_state={"R": 10.0},
+        profile=profile,
+        readout_fn=lambda _n, _st: "8.0 V",
+    )
+    sess_ext = _make_session(
+        tmp_path / "task_cancel",
+        profile=profile,
+        page=page_ext,
+        ocr=_TransientMockOcrBackend(frame_texts),  # type: ignore[arg-type]
+    )
+    watch_task = asyncio.create_task(
+        sess_ext.watch(
+            WatchSpec(readouts=["Vc"], duration_s=5.0, interval_ms=25, save_dataset=True)
+        )
+    )
+    await asyncio.sleep(0.07)
+    watch_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await watch_task
+    assert sess_ext.workspace.read_status().phase == "cancelled"
+    ext_partial = json.loads(
+        (sess_ext.workspace.root / "partial-readings.json").read_text("utf-8")
+    )
+    assert ext_partial["status"] == "cancelled"
+    assert ext_partial["count"] >= 2
+    assert len(list(sess_ext.workspace.evidence_dir.glob("watch-*.png"))) == ext_partial["count"]
+    assert sess_ext.workspace.verify_provenance().ok is True
+
+    # (c) Mid-burst RuntimeError on 3rd screenshot flushes frames 0 & 1 before re-raising
+    page_err = _MockSimPage(
+        initial_state={"R": 10.0},
+        profile=profile,
+        readout_fn=lambda _n, _st: "7.0 V",
+    )
+    orig_shot = page_err.screenshot
+
+    async def _boom_on_third(*, type: str = "png") -> bytes:  # noqa: A002
+        if page_err.screenshot_count >= 2:
+            raise RuntimeError("simulated burst disconnect")
+        return await orig_shot(type=type)
+
+    page_err.screenshot = _boom_on_third  # type: ignore[method-assign]
+    sess_err = _make_session(
+        tmp_path / "burst_error",
+        profile=profile,
+        page=page_err,
+        ocr=_TransientMockOcrBackend(frame_texts),  # type: ignore[arg-type]
+    )
+    with pytest.raises(RuntimeError, match="simulated burst disconnect"):
+        await sess_err.watch(
+            WatchSpec(readouts=["Vc"], duration_s=5.0, interval_ms=15, save_dataset=True)
+        )
+    assert sess_err.workspace.read_status().phase == "failed"
+    err_partial = json.loads(
+        (sess_err.workspace.root / "partial-readings.json").read_text("utf-8")
+    )
+    assert err_partial["status"] == "failed"
+    assert err_partial["count"] == 2
+    assert len(list(sess_err.workspace.evidence_dir.glob("watch-*.png"))) == 2
+    assert sess_err.workspace.verify_provenance().ok is True
+
+
+async def test_protocols_m2_sim_watch_and_compute_sim_delegation(tmp_path: Path) -> None:
+    profile = _build_transient_profile()
+    frame_texts = {i: {"Vc": f"{5.0 - 0.1 * i:.2f} V"} for i in range(1, 10)}
+    page = _MockSimPage(
+        initial_state={"R": 10.0},
+        profile=profile,
+        readout_fn=lambda _n, _st: "5.0 V",
+    )
+    session = _make_session(
+        tmp_path,
+        profile=profile,
+        page=page,
+        ocr=_TransientMockOcrBackend(frame_texts),  # type: ignore[arg-type]
+    )
+
+    # Accepts both WatchSpec and dict payloads via protocols_m2.sim_watch(session, spec)
+    watch_spec = WatchSpec(readouts=["Vc"], duration_s=0.05, interval_ms=20, max_frames=2)
+    res_model = await sim_watch(session, watch_spec)
+    assert isinstance(res_model, WatchResult)
+    assert res_model.captured_frames == 2
+
+    res_dict = await sim_watch(
+        session,
+        {"readouts": ["Vc"], "duration_s": 0.05, "interval_ms": 20, "max_frames": 2},
+    )
+    assert isinstance(res_dict, WatchResult)
+    assert res_dict.captured_frames == 2
+    assert session.workspace.verify_provenance().ok is True
+
+    # Accepts both ComputeSimSpec and dict payloads via protocols_m2.compute_sim(spec, workspace)
     compute_spec = ComputeSimSpec(
         model_kind="algebraic_grid",
         expression="1 / sqrt(1 + w**2)",
         grid_variable="w",
         grid_start=0.0,
         grid_stop=10.0,
+        grid_points=21,
     )
-    with pytest.raises(NotImplementedError, match="Milestone 2"):
-        compute_sim(compute_spec)
+    comp_model = compute_sim(compute_spec, session.workspace)
+    assert isinstance(comp_model, ComputeSimResult)
+    assert comp_model.provenance == "model_computed"
+    assert comp_model.row_count == 21
+    assert comp_model.columns == ["w", "y"]
+    assert comp_model.dataset_id == "compute-algebraic_grid-0001"
+    assert len(comp_model.preview_rows) == 10
+    assert math.isclose(comp_model.preview_rows[0]["y"], 1.0, rel_tol=1e-12)
+    assert math.isclose(comp_model.preview_rows[-1]["y"], 1.0 / math.sqrt(101.0), rel_tol=1e-12)
+
+    comp_dict = compute_sim(
+        {
+            "model_kind": "algebraic_grid",
+            "expression": "2 * w + 1",
+            "grid_variable": "w",
+            "grid_start": 0.0,
+            "grid_stop": 4.0,
+            "grid_points": 5,
+        },
+        session.workspace,
+    )
+    assert isinstance(comp_dict, ComputeSimResult)
+    assert comp_dict.provenance == "model_computed"
+    assert comp_dict.dataset_id == "compute-algebraic_grid-0002"
+    assert len(comp_dict.preview_rows) == 5
+
+    prov_entries = session.workspace.read_provenance()
+    target_relpaths = {comp_model.dataset_relpath, comp_dict.dataset_relpath}
+    compute_entries = [e for e in prov_entries if e.relpath in target_relpaths]
+    assert len(compute_entries) == 2
+    assert all(e.source == "model_computed" for e in compute_entries)
+    assert session.workspace.verify_provenance().ok is True
+
+
+async def test_sim_watch_edge_cases_zero_frame_cancel_custom_id_multi_readout_and_concurrent(
+    tmp_path: Path,
+) -> None:
+    profile = _build_transient_profile()
+
+    # 1. Calling watch() without an attached profile fails fast without touching the page
+    page_no_prof = _MockSimPage(
+        initial_state={"R": 10.0},
+        profile=profile,
+        readout_fn=lambda _n, _st: "1.0 V",
+    )
+    cfg = PeaConfig(
+        project_root=REPO_ROOT,
+        local_assets_dir=REPO_ROOT / "local_assets",
+        runs_dir=tmp_path / "runs",
+        profiles_dir=tmp_path / "profiles",
+    )
+    ws_no_prof = WorkspaceManager.from_config(cfg).create_run(source="simulator_captured")
+    sess_no_prof = SimulatorSession(
+        session_id="sim-noprof",
+        config=cfg,
+        workspace=ws_no_prof,
+        ocr=_TransientMockOcrBackend({}),  # type: ignore[arg-type]
+        profile_store=ProfileStore.from_config(cfg),
+        page=page_no_prof,
+        target_url="http://127.0.0.1:50002/",
+        loopback_origin="http://127.0.0.1:50002",
+        stage_width=800,
+        stage_height=600,
+        profile=None,
+    )
+    with pytest.raises(RuntimeError, match="No CalibrationProfile"):
+        await sess_no_prof.watch(WatchSpec(readouts=["Vc"], duration_s=0.1, interval_ms=20))
+    assert page_no_prof.screenshot_count == 0
+
+    # 2. Cooperative cancel BEFORE frame 0 (during settle_ms) returns valid 0-frame WatchResult
+    page_zero = _MockSimPage(
+        initial_state={"R": 10.0},
+        profile=profile,
+        readout_fn=lambda _n, _st: "1.0 V",
+    )
+    sess_zero = _make_session(
+        tmp_path / "zero_cancel",
+        profile=profile,
+        page=page_zero,
+        ocr=_TransientMockOcrBackend({}),  # type: ignore[arg-type]
+    )
+
+    async def _cancel_during_settle(_ms: int) -> None:
+        sess_zero.request_cancel()
+
+    page_zero.wait_for_timeout = _cancel_during_settle  # type: ignore[method-assign]
+    res_zero = await sess_zero.watch(
+        WatchSpec(
+            readouts=["Vc"],
+            duration_s=1.0,
+            interval_ms=25,
+            settle_ms=10,
+            save_dataset=True,
+        )
+    )
+    assert res_zero.status == "cancelled"
+    assert res_zero.captured_frames == 0
+    assert res_zero.points == []
+    assert res_zero.dataset_id is None
+    assert res_zero.dataset_relpath is None
+    assert sess_zero.workspace.read_status().phase == "cancelled"
+    assert sess_zero.workspace.verify_provenance().ok is True
+
+    # 3. Custom non-colliding dataset_id + multi-readout stability (2nd readout drift prevents stop)
+    multi_frames: dict[int, dict[str, str]] = {
+        1: {"Vc": "1.00 V", "t_sim": "0.10 s"},
+        2: {"Vc": "1.00 V", "t_sim": "0.20 s"},
+        3: {"Vc": "1.00 V", "t_sim": "0.30 s"},
+        4: {"Vc": "1.00 V", "t_sim": "0.30 s"},
+        5: {"Vc": "1.00 V", "t_sim": "0.30 s"},
+        6: {"Vc": "1.00 V", "t_sim": "0.30 s"},
+        7: {"Vc": "1.00 V", "t_sim": "0.30 s"},
+    }
+    page_multi = _MockSimPage(
+        initial_state={"R": 10.0},
+        profile=profile,
+        readout_fn=lambda _n, _st: "1.00 V",
+    )
+    sess_multi = _make_session(
+        tmp_path / "multi_stable",
+        profile=profile,
+        page=page_multi,
+        ocr=_TransientMockOcrBackend(multi_frames),  # type: ignore[arg-type]
+    )
+    res_multi = await sess_multi.watch(
+        WatchSpec(
+            readouts=["Vc", "t_sim"],
+            duration_s=2.0,
+            interval_ms=20,
+            stop_when_stable_s=0.04,
+            stability_tol=0.005,
+            save_dataset=True,
+            dataset_id="rc_trial_custom",
+        )
+    )
+    assert res_multi.status == "stopped_stable"
+    assert res_multi.dataset_id == "rc_trial_custom"
+    assert res_multi.dataset_relpath == "datasets/rc_trial_custom.json"
+    # t_sim changed on shots 1->2->3, so stability could only anchor at shot 3 (index 2)
+    assert res_multi.captured_frames >= 5
+    assert sess_multi.workspace.verify_provenance().ok is True
+
+    # 4. Concurrent multi-session watch() calls sharing one RunWorkspace produce unique artifacts
+    shared_wm = WorkspaceManager(tmp_path / "conc_watch" / "runs")
+    shared_ws = shared_wm.create_run(label="concurrent-watch", source="simulator_captured")
+    shared_cfg = PeaConfig(
+        project_root=REPO_ROOT,
+        local_assets_dir=REPO_ROOT / "local_assets",
+        runs_dir=tmp_path / "conc_watch" / "runs",
+        profiles_dir=tmp_path / "conc_watch" / "profiles",
+    )
+    shared_ps = ProfileStore.from_config(shared_cfg)
+    conc_frames = {i: {"Vc": f"{10.0 - 0.2 * i:.2f} V"} for i in range(1, 20)}
+
+    async def _watch_worker(worker_idx: int) -> WatchResult:
+        p_w = _MockSimPage(
+            initial_state={"R": 10.0},
+            profile=profile,
+            readout_fn=lambda _n, _st: "5.0 V",
+        )
+        s_w = SimulatorSession(
+            session_id=f"sim-watch-conc-{worker_idx}",
+            config=shared_cfg,
+            workspace=shared_ws,
+            ocr=_TransientMockOcrBackend(conc_frames),  # type: ignore[arg-type]
+            profile_store=shared_ps,
+            page=p_w,
+            target_url="http://127.0.0.1:50009/",
+            loopback_origin="http://127.0.0.1:50009",
+            stage_width=profile.stage_width,
+            stage_height=profile.stage_height,
+            profile=profile,
+        )
+        return await s_w.watch(
+            WatchSpec(readouts=["Vc"], duration_s=0.05, interval_ms=20, max_frames=2)
+        )
+
+    w_results = await asyncio.gather(_watch_worker(0), _watch_worker(1), _watch_worker(2))
+    assert len({r.dataset_id for r in w_results}) == 3
+    assert len({r.readings_relpath for r in w_results}) == 3
+    all_shots = {pt.screenshot_relpath for r in w_results for pt in r.points}
+    assert len(all_shots) == sum(r.captured_frames for r in w_results)
+    assert shared_ws.verify_provenance().ok is True
+
+
+async def test_sim_watch_reserved_columns_settle_cancel_drift_and_combined_stops(
+    tmp_path: Path,
+) -> None:
+    # 1. Reserved dataset column collision fails fast when save_dataset=True, succeeds when False
+    prof_res = _build_transient_profile()
+    prof_res.readouts["elapsed_s"] = ReadoutSpec(
+        name="elapsed_s",
+        roi_px=(10, 10, 80, 40),
+        ocr_mode="rec_only",
+        parse_mode="float",
+    )
+    prof_res.readouts["screenshot_relpath"] = ReadoutSpec(
+        name="screenshot_relpath",
+        roi_px=(10, 50, 80, 80),
+        ocr_mode="rec_only",
+        parse_mode="float",
+    )
+    page_res = _MockSimPage(
+        initial_state={"R": 10.0},
+        profile=prof_res,
+        readout_fn=lambda _n, _st: "42.0",
+    )
+    ocr_res = _TransientMockOcrBackend(
+        {1: {"elapsed_s": "999.0", "screenshot_relpath": "42.0"}}
+    )
+    sess_res = _make_session(
+        tmp_path / "reserved_col",
+        profile=prof_res,
+        page=page_res,
+        ocr=ocr_res,  # type: ignore[arg-type]
+    )
+    with pytest.raises(ValueError, match="collide with reserved watch dataset columns"):
+        await sess_res.watch(
+            WatchSpec(
+                readouts=["elapsed_s"],
+                duration_s=0.05,
+                interval_ms=20,
+                save_dataset=True,
+            )
+        )
+    with pytest.raises(ValueError, match="collide with reserved watch dataset columns"):
+        await sess_res.watch(
+            WatchSpec(
+                readouts=["screenshot_relpath"],
+                duration_s=0.05,
+                interval_ms=20,
+                save_dataset=True,
+            )
+        )
+    assert page_res.screenshot_count == 0
+    ok_no_ds = await sess_res.watch(
+        WatchSpec(
+            readouts=["elapsed_s", "screenshot_relpath"],
+            duration_s=0.005,
+            interval_ms=50,
+            save_dataset=False,
+        )
+    )
+    # Also verifies duration_s < interval_ms yields exactly 1 immediate frame
+    assert ok_no_ds.status == "complete"
+    assert ok_no_ds.captured_frames == 1
+    assert ok_no_ds.points[0].readouts["elapsed_s"] == pytest.approx(999.0)
+    assert ok_no_ds.points[0].readouts["screenshot_relpath"] == pytest.approx(42.0)
+
+    # 2. Cooperative cancel during long settle_ms wakes immediately & skips blur + triggers
+    prof_settle = _build_transient_profile()
+    clicks_seen: list[tuple[int, int]] = []
+    page_settle = _MockSimPage(
+        initial_state={"R": 10.0},
+        profile=prof_settle,
+        readout_fn=lambda _n, _st: "10.0 V",
+    )
+    orig_click = page_settle.on_click
+
+    def _track_click(x: int, y: int) -> None:
+        clicks_seen.append((x, y))
+        orig_click(x, y)
+
+    async def _real_sleep_wait(ms: int) -> None:
+        await asyncio.sleep(ms / 1000.0)
+
+    page_settle.on_click = _track_click  # type: ignore[method-assign]
+    page_settle.wait_for_timeout = _real_sleep_wait  # type: ignore[method-assign]
+    sess_settle = _make_session(
+        tmp_path / "settle_cancel",
+        profile=prof_settle,
+        page=page_settle,
+        ocr=_TransientMockOcrBackend({}),  # type: ignore[arg-type]
+    )
+
+    async def _cancel_during_long_settle() -> None:
+        await asyncio.sleep(0.03)
+        sess_settle.request_cancel()
+
+    t_wall0 = time.perf_counter()
+    c_task = asyncio.create_task(_cancel_during_long_settle())
+    res_settle = await sess_settle.watch(
+        WatchSpec(
+            readouts=["Vc"],
+            duration_s=2.0,
+            interval_ms=25,
+            settle_ms=3000,
+            blur_before_capture=True,
+            trigger_action=ActionStep(action="click", control="start"),
+            save_dataset=True,
+        )
+    )
+    await c_task
+    assert (time.perf_counter() - t_wall0) < 1.0
+    assert res_settle.status == "cancelled"
+    assert res_settle.captured_frames == 0
+    assert res_settle.actual_duration_s == 0.0
+    assert clicks_seen == []  # Neither blur nor start trigger executed after cancellation
+    assert page_settle.screenshot_count == 0
+    assert sess_settle.workspace.read_status().phase == "cancelled"
+    assert sess_settle.workspace.verify_provenance().ok is True
+
+    # 3. Single slow frame recovers onto original t0 grid without a back-to-back burst storm
+    prof_stall = _build_transient_profile()
+    page_stall = _MockSimPage(
+        initial_state={"R": 10.0},
+        profile=prof_stall,
+        readout_fn=lambda _n, _st: "5.0 V",
+    )
+    orig_shot_stall = page_stall.screenshot
+
+    async def _stall_frame0(*, type: str = "png") -> bytes:  # noqa: A002
+        if page_stall.screenshot_count == 0:
+            await asyncio.sleep(0.11)
+        return await orig_shot_stall(type=type)
+
+    page_stall.screenshot = _stall_frame0  # type: ignore[method-assign]
+    sess_stall = _make_session(
+        tmp_path / "stall_drift",
+        profile=prof_stall,
+        page=page_stall,
+        ocr=_TransientMockOcrBackend({i: {"Vc": "5.0 V"} for i in range(1, 30)}),  # type: ignore[arg-type]
+    )
+    res_stall = await sess_stall.watch(
+        WatchSpec(readouts=["Vc"], duration_s=0.22, interval_ms=30, save_dataset=False)
+    )
+    assert res_stall.status == "complete"
+    # Without missed-slot skipping, frame 0 stalling 110ms would burst 4 frames within ~15ms;
+    # with slot skipping, frame 1 fires immediately after the stall and frames 2+ resume 30ms grid.
+    assert res_stall.captured_frames <= 6
+    assert res_stall.captured_frames >= 3
+    if len(res_stall.points) >= 4:
+        # Frames after the immediate recovery frame must be paced near interval_ms (~30ms)
+        post_gaps = [
+            (res_stall.points[i + 1].elapsed_s or 0.0) - (res_stall.points[i].elapsed_s or 0.0)
+            for i in range(2, len(res_stall.points) - 1)
+        ]
+        assert all(gap >= 0.015 for gap in post_gaps)
+
+    # 4. Simultaneous stop_when_stable_s + threshold stop: threshold wins vs. stability wins
+    prof_combo = _build_transient_profile()
+    # (a) Threshold hits before stability duration
+    page_c1 = _MockSimPage(
+        initial_state={"R": 10.0},
+        profile=prof_combo,
+        readout_fn=lambda _n, _st: "1.0 V",
+    )
+    sess_c1 = _make_session(
+        tmp_path / "combo_thr",
+        profile=prof_combo,
+        page=page_c1,
+        ocr=_TransientMockOcrBackend({1: {"Vc": "5.0 V"}, 2: {"Vc": "3.0 V"}, 3: {"Vc": "1.5 V"}}),  # type: ignore[arg-type]
+    )
+    res_c1 = await sess_c1.watch(
+        WatchSpec(
+            readouts=["Vc"],
+            duration_s=2.0,
+            interval_ms=20,
+            stop_when_stable_s=0.20,
+            stability_tol=0.0,
+            stop_readout="Vc",
+            stop_op="le",
+            stop_value=2.0,
+            save_dataset=False,
+        )
+    )
+    assert res_c1.status == "stopped_threshold"
+    assert res_c1.captured_frames == 3
+
+    # (b) Stability fires first with stability_tol=0.0 (1e-4 drift re-anchors, repeats stop)
+    page_c2 = _MockSimPage(
+        initial_state={"R": 10.0},
+        profile=prof_combo,
+        readout_fn=lambda _n, _st: "3.0 V",
+    )
+    sess_c2 = _make_session(
+        tmp_path / "combo_stab",
+        profile=prof_combo,
+        page=page_c2,
+        ocr=_TransientMockOcrBackend(  # type: ignore[arg-type]
+            {
+                1: {"Vc": "3.0000 V"},
+                2: {"Vc": "3.0001 V"},  # Drift > 0.0 tol -> re-anchors here
+                3: {"Vc": "3.0001 V"},
+                4: {"Vc": "3.0001 V"},
+                5: {"Vc": "3.0001 V"},
+                6: {"Vc": "3.0001 V"},
+            }
+        ),
+    )
+    res_c2 = await sess_c2.watch(
+        WatchSpec(
+            readouts=["Vc"],
+            duration_s=2.0,
+            interval_ms=20,
+            stop_when_stable_s=0.05,
+            stability_tol=0.0,
+            stop_readout="Vc",
+            stop_op="le",
+            stop_value=2.0,
+            save_dataset=False,
+        )
+    )
+    assert res_c2.status == "stopped_stable"
+    assert res_c2.captured_frames >= 5
+
+    # 5. Unrelated datasets (e.g. lab5-2026.json) must not pollute watch-0001 auto-numbering
+    sess_num = _make_session(
+        tmp_path / "watch_num",
+        profile=prof_combo,
+        page=_MockSimPage(
+            initial_state={"R": 10.0}, profile=prof_combo, readout_fn=lambda _n, _st: "5.0 V"
+        ),
+        ocr=_TransientMockOcrBackend({1: {"Vc": "5.0 V"}}),  # type: ignore[arg-type]
+    )
+    ds_dir = sess_num.workspace.resolve_path("datasets")
+    ds_dir.mkdir(parents=True, exist_ok=True)
+    (ds_dir / "lab5-2026.json").write_text("{}", encoding="utf-8")
+    res_num = await sess_num.watch(
+        WatchSpec(readouts=["Vc"], duration_s=0.01, interval_ms=20, max_frames=1, save_dataset=True)
+    )
+    assert res_num.dataset_id == "watch-0001"
+    assert sess_num.workspace.verify_provenance().ok is True
+
+
+async def test_sim_watch_ocr_failure_during_flush_and_html5_open_stage_handling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _build_transient_profile()
+
+    class _BoomOcr:
+        backend_name = "rapidocr"
+
+        def __init__(self, fail_after: int) -> None:
+            self.calls = 0
+            self.fail_after = fail_after
+
+        def recognize(self, _image: object, *, mode: OcrMode = "det_rec") -> OcrResult:
+            return OcrResult(backend="rapidocr", mode=mode, elapsed_ms=0.1, boxes=[])
+
+        def read_spec(
+            self,
+            _image: object,
+            _spec: ReadoutSpec,
+        ) -> tuple[OcrResult, float | int | str | None, str | None]:
+            self.calls += 1
+            if self.calls > self.fail_after:
+                raise RuntimeError("ocr crash during flush")
+            return (
+                OcrResult(backend="rapidocr", mode="rec_only", elapsed_ms=0.1, boxes=[]),
+                5.0,
+                "V",
+            )
+
+    # (a) External asyncio.CancelledError mid-burst with failing OCR STILL persists cancelled
+    # status/readings and propagates CancelledError (never swallowed by OCR crash).
+    sess_cancel_boom = _make_session(
+        tmp_path / "cancel_ocr_boom",
+        profile=profile,
+        page=_MockSimPage(
+            initial_state={"R": 10.0}, profile=profile, readout_fn=lambda _n, _st: "5.0 V"
+        ),
+        ocr=_BoomOcr(fail_after=0),  # type: ignore[arg-type]
+    )
+    t_watch = asyncio.create_task(
+        sess_cancel_boom.watch(WatchSpec(readouts=["Vc"], duration_s=5.0, interval_ms=20))
+    )
+    await asyncio.sleep(0.05)
+    t_watch.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t_watch
+    assert sess_cancel_boom.workspace.read_status().phase == "cancelled"
+    assert list((sess_cancel_boom.workspace.root / "readings").glob("watch-*.json"))
+    assert sess_cancel_boom.workspace.verify_provenance().ok is True
+
+    # (b) OCR crash during normal post-OCR flush does NOT re-invoke flush on remaining buffer
+    sess_flush_boom = _make_session(
+        tmp_path / "flush_ocr_boom",
+        profile=profile,
+        page=_MockSimPage(
+            initial_state={"R": 10.0}, profile=profile, readout_fn=lambda _n, _st: "5.0 V"
+        ),
+        ocr=_BoomOcr(fail_after=1),  # type: ignore[arg-type]
+    )
+    with pytest.raises(RuntimeError, match="ocr crash during flush"):
+        await sess_flush_boom.watch(
+            WatchSpec(readouts=["Vc"], duration_s=0.10, interval_ms=15, max_frames=4)
+        )
+    assert sess_flush_boom.workspace.read_status().phase == "failed"
+    flush_partial = json.loads(
+        (sess_flush_boom.workspace.root / "partial-readings.json").read_text("utf-8")
+    )
+    assert flush_partial["status"] == "failed"
+    assert flush_partial["count"] == 1
+    # Frame 0 succeeded (watch-0001.png), frame 1 wrote watch-0002.png then OCR threw;
+    # frame 2 MUST NOT be written by a duplicate flush call in the except block.
+    assert len(list(sess_flush_boom.workspace.evidence_dir.glob("watch-*.png"))) == 2
+    assert sess_flush_boom.workspace.verify_provenance().ok is True
+
+    # (c) SimulatorManager.open(html5_dir=...) auto-loads matching-stage profile and gracefully
+    # leaves profile=None when reopened at a different viewport size (no ValueError lockout).
+    html5_dir = tmp_path / "html5_rc"
+    html5_dir.mkdir()
+    (html5_dir / "index.html").write_text("<h1>RC Sim</h1>", encoding="utf-8")
+    html5_sha = compute_html5_dir_sha256(html5_dir)
+
+    cfg = PeaConfig(
+        project_root=REPO_ROOT,
+        local_assets_dir=REPO_ROOT / "local_assets",
+        runs_dir=tmp_path / "mgr_runs",
+        profiles_dir=tmp_path / "mgr_profiles",
+    )
+    store = ProfileStore.from_config(cfg)
+    saved_prof = CalibrationProfile(
+        swf_sha256=html5_sha,
+        stage_width=640,
+        stage_height=420,
+        header_height_px=0,
+        readouts={
+            "Vc": ReadoutSpec(
+                name="Vc",
+                roi_px=(10, 10, 120, 40),
+                ocr_mode="rec_only",
+                parse_mode="float",
+            )
+        },
+    )
+    store.save(saved_prof, expected_stage=(640, 420))
+
+    class _FakePage:
+        async def route(self, _pattern: str, _handler: Any) -> None:
+            return
+
+        def on(self, _event: str, _handler: Any) -> None:
+            return
+
+        async def goto(self, _target: str, *, wait_until: str = "domcontentloaded") -> None:
+            return
+
+        async def wait_for_timeout(self, _ms: int) -> None:
+            return
+
+        async def close(self) -> None:
+            return
+
+    class _FakeContext:
+        async def new_page(self) -> _FakePage:
+            return _FakePage()
+
+        async def close(self) -> None:
+            return
+
+    class _FakeBrowser:
+        async def new_context(self, **_kwargs: Any) -> _FakeContext:
+            return _FakeContext()
+
+    monkeypatch.setattr(SimRuntimeServer, "start", lambda self: "http://127.0.0.1:59991")
+    monkeypatch.setattr(SimRuntimeServer, "stop", lambda self: None)
+
+    mgr = SimulatorManager(
+        cfg,
+        profile_store=store,
+        ocr=_TransientMockOcrBackend({}),  # type: ignore[arg-type]
+    )
+
+    async def _fake_browser() -> _FakeBrowser:
+        return _FakeBrowser()
+
+    mgr._ensure_browser = _fake_browser  # type: ignore[method-assign]
+
+    # Matching viewport (640x420) auto-loads the saved profile
+    sess_match = await mgr.open(
+        html5_dir=html5_dir, viewport_width=640, viewport_height=420, settle_ms=0
+    )
+    try:
+        assert sess_match.sim_sha256 == html5_sha
+        assert sess_match.profile is not None
+        assert sess_match.profile.swf_sha256 == html5_sha
+    finally:
+        await mgr.close_session(sess_match.session_id)
+
+    # Different viewport (1024x768) opens cleanly with profile=None so caller can recalibrate
+    sess_diff = await mgr.open(
+        html5_dir=html5_dir, viewport_width=1024, viewport_height=768, settle_ms=0
+    )
+    try:
+        assert sess_diff.sim_sha256 == html5_sha
+        assert sess_diff.profile is None
+    finally:
+        await mgr.close_session(sess_diff.session_id)

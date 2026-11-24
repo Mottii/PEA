@@ -1,8 +1,8 @@
 # PEA v2 — Master Implementation Plan & Progress Tracker
 
-> **Current Status:** `Phase 3 Complete (M1 Verified — Dual-Lab Live E2E, Visual QA, .mcpb & Viewer Passed)`
-> **Last Updated:** `2026-11-22`
-> **Phase Runbooks:** [`PHASE_0_PLAN.md`](./PHASE_0_PLAN.md) · [`PHASE_1_PLAN.md`](./PHASE_1_PLAN.md) · [`PHASE_2_PLAN.md`](./PHASE_2_PLAN.md) · [`PHASE_3_PLAN.md`](./PHASE_3_PLAN.md)
+> **Current Status:** `Milestone 2 Complete (v0.3.0 — 18 Tools, sim_watch, compute_sim, Datasets Viewer & 3 Live E2E Benchmarks Passed)`
+> **Last Updated:** `2026-11-24`
+> **Phase Runbooks:** [`PHASE_0_PLAN.md`](./PHASE_0_PLAN.md) · [`PHASE_1_PLAN.md`](./PHASE_1_PLAN.md) · [`PHASE_2_PLAN.md`](./PHASE_2_PLAN.md) · [`PHASE_3_PLAN.md`](./PHASE_3_PLAN.md) · [`MILESTONE_2_PLAN.md`](./MILESTONE_2_PLAN.md)
 
 This document is the single source of truth for rebuilding **PEA (Physics Experiments Automation)** into a universal, zero-API-cost MCP server, Agent Skill, Claude Desktop extension (`.mcpb`), and lightweight local viewer. Update the checkboxes and Progress Log below at the end of every phase or milestone.
 
@@ -85,12 +85,13 @@ PEA/
 │   │   ├── swf_meta.py               # Parses CWS/FWS header for exact native (W, H), FPS, SHA-256
 │   │   ├── profiles.py               # Load/save/validate SHA-256 keyed Calibration Profiles
 │   │   ├── runtime_server.py         # Loopback-only HTTP server for Ruffle & local HTML5 sims
-│   │   ├── engine.py                 # Playwright session manager: open, observe, act, sweep, search_extremum
-│   │   └── protocols_m2.py           # M2 interface stubs (sim_watch, compute_sim)
+│   │   ├── engine.py                 # Playwright session manager: open, observe, act, sweep, search_extremum, watch
+│   │   └── protocols_m2.py           # Milestone 2 protocol wrappers (sim_watch, compute_sim)
 │   ├── math_engine/
 │   │   ├── __init__.py
 │   │   ├── calculator.py             # Safe 5-dim SI AST evaluator (mechanics + electrical/AC + complex + vectors)
-│   │   └── analysis.py               # Bench/sim ingest, safe column formulas, free/zero-intercept OLS, % dev
+│   │   ├── analysis.py               # Bench/sim ingest, safe column formulas, free/zero-intercept OLS, % dev
+│   │   └── compute_sim.py            # Sandboxed zero-eval ODE IVP (RK45/Radau/BDF), algebraic grid & FFT engine
 │   ├── visuals/
 │   │   ├── __init__.py
 │   │   ├── plots.py                  # Matplotlib vector SVG + 300 DPI PNG plots
@@ -104,8 +105,8 @@ PEA/
 │   ├── viewer/
 │   │   ├── __init__.py
 │   │   ├── app.py                    # Lightweight Starlette loopback viewer
-│   │   └── static/                   # Minimal clean dashboard UI
-│   └── mcp_server.py                 # MCPServer stdio server registering 16 universal tools + pea://policy
+│   │   └── static/                   # Minimal clean dashboard UI (with Datasets & Model Outputs view)
+│   └── mcp_server.py                 # MCPServer stdio server registering 18 universal tools + pea://policy
 ├── skills/
 │   └── pea-lab-assistant/
 │       └── SKILL.md                  # Universal workflow & guardrails for any connecting agent
@@ -117,14 +118,18 @@ PEA/
 │   ├── test_swf_meta.py
 │   ├── test_calculator.py
 │   ├── test_analysis.py
+│   ├── test_compute_sim.py
 │   ├── test_visuals.py
 │   ├── test_pdf_intake.py
 │   ├── test_report_builders.py
 │   ├── test_ocr_and_profiles.py
 │   ├── test_mcp_protocol.py
+│   ├── fixtures/
+│   │   └── html5_rc_sim/index.html   # Deterministic zero-network HTML5 RC/RLC transient fixture
 │   └── e2e/
 │       ├── test_lab4_e2e.py          # Real Ruffle SWF grid sweep benchmark (m96210 + m96211)
-│       └── test_lab5_e2e.py          # Real Ruffle SWF plateau search benchmark (m96220)
+│       ├── test_lab5_e2e.py          # Real Ruffle SWF plateau search benchmark (m96220)
+│       └── test_transient_m2_e2e.py  # Live HTML5 RC discharge + damped RLC sim_watch/ODE/FFT benchmark
 ├── local_assets/                     # [GITIGNORED] ruffle/, katex/, fonts/, ocr/, sims/ (m96210, m96211, m96220)
 └── runs/                             # [GITIGNORED] Per-run screenshots, OCR logs, reports, evidence ZIPs
 ```
@@ -193,9 +198,10 @@ PEA/
 - [x] **3.3** **Lab 4 Live E2E Benchmark (`test_lab4_e2e.py`):** Same generic tools on `m96210.swf` + `m96211.swf`, Team 2 (72 readings), 72/72 readout match check, handout-compliant Tables 2–3 (transformed rows), linearized $1/r$ & $(R^2+r^2)^{-3/2}$ plots, slopes & $\mu_0$ % deviations, PDF + DOCX + `evidence.zip`, full page visual inspection
 - [x] **3.4** Build `dist/pea-mcp-0.2.0.mcpb`, audit ZIP contents (zero SWFs/handouts/secrets), and verify local Starlette viewer on desktop (`1280px`) and mobile (`390px`) viewports
 
-### Milestone 2 Backlog (Deferred After M1)
-- [ ] **M2.1** `sim_watch`: Frame-timestamped transient/stopwatch capture (supports Lab 3 RC discharge & time-domain sims)
-- [ ] **M2.2** `compute_sim`: Sandboxed NumPy/SciPy numerical/ODE modeling explicitly tagged `model_computed`
+### Milestone 2 — Timed Transients (`sim_watch`) & Sandboxed Numerical/ODE/FFT Modeling (`compute_sim`)
+> Detailed execution plan and verification findings live in [`MILESTONE_2_PLAN.md`](./MILESTONE_2_PLAN.md) (`M2A`–`M2D`). **Complete (`2026-11-24`).**
+- [x] **M2.1** `sim_watch`: Drift-compensated hybrid timed transient/stopwatch capture (`burst_post_ocr` + `inline_ocr` stability/threshold early stops, HTML5/URL SHA-256 fingerprinting, atomic evidence & `simulator_captured` dataset export)
+- [x] **M2.2** `compute_sim`: Sandboxed zero-`eval`/`exec` NumPy/SciPy numerical, coupled ODE (`RK45`/`Radau`/`BDF`), algebraic grid, and one-sided FFT engine unconditionally tagged `model_computed`
 - [x] **M2.3** ~~Cross-platform `RapidOcrBackend` (ONNX Runtime) fallback~~ → **Promoted to M1 (`Phase 2A.1`)** following Phase 0 macOS `27.2` Vision `.accurate` hang discovery.
 
 ---
@@ -223,3 +229,4 @@ PEA/
 | 2026-11-21 | Phase 2C | Implemented offline PDF handout intake (`src/pea/pdf_intake.py` via `pypdfium2` + `pypdf` with atomic PNG renders, `extracted-text.json`, encrypted/zero-page/rotated PDF handling, and provenance immutability guards) and submission-ready report compiler (`src/pea/report/`: academic EN/RU HTML+CSS+offline-KaTeX+Noto-Sans templates with single-pass token rendering & `.table-compact`/`.card-compact` pagination, IPv4/IPv6 loopback `_OfflineRenderServer` + strict zero-external-network + missing-asset fail-hard Playwright Chromium A4 PDF exporter & `preview_report_pages` in `pdf_builder.py`, multi-line `\begin{aligned}` KaTeX support, editable `python-docx` mirror in `docx_builder.py`, raw `evidence.zip` packager with duplicate-profile disambiguation + lenient corrupt-ledger/on-disk-SHA-256 `teacher-evidence.pdf` audit packet in `evidence.py`, and localized unified `build_report` orchestrator in `__init__.py`). | `122/122` offline tests pass (`.venv/bin/pytest tests/ -m "not live_sim" -v`, adding `14` new tests across `test_pdf_intake.py` and `test_report_builders.py`), `.venv/bin/ruff check src/ tests/ scripts/` clean (`0` errors), 8-page `lab5-rlc-handout.pdf` + encrypted/zero-page/rotated PDF intake verified, EN/RU/Teacher/35-row+tall-card preview PNGs visually inspected, external network blocking, missing-asset fail-hard, IPv4/IPv6 `Host`/traversal guards, and `evidence.zip` SHA-256 manifest + symlink/`.tmp` exclusions verified, clean local commits on `main` (no remote push). |
 | 2026-11-21 | Phase 2D | Implemented `mcp==2.3.0` `MCPServer` stdio server (`src/pea/mcp_server.py`: all 16 universal tools with `ToolAnnotations`, `additionalProperties: false` schema hardening, `pea://policy` resource, startup crash recovery + graceful Playwright/loopback shutdown via `lifespan`, strict path confinement, zero shell/FS tools, orphan-run prevention, OCR log handoff), loopback-only Starlette local viewer (`src/pea/viewer/{__init__.py,app.py,static/{index.html,style.css,app.js}}`: read-only `GET`/`HEAD`, anti-DNS-rebinding `Host` & same-origin loopback `Origin` guards, strict CSP/sandbox/`nosniff`, responsive `1280px`/`390px` UI with SVG OCR box toggle, annotated PNG toggle, provenance verification badge, and downloads), companion Agent Skill (`skills/pea-lab-assistant/SKILL.md`), Claude Desktop `.mcpb` v0.3 packaging (`packaging/mcpb/{manifest.json,launcher.mjs}` + `scripts/build_mcpb.py` deterministic builder & security auditor), and updated `README.md`. | `132/132` offline tests pass (`.venv/bin/pytest tests/ -m "not live_sim" -v`, adding `10` tests in `tests/test_mcp_protocol.py`), `.venv/bin/ruff check src/ tests/ scripts/` clean (`0` errors), `.venv/bin/python scripts/build_mcpb.py --check` passed (`dist/pea-mcp-0.2.0.mcpb` audited), live `mcp.client.stdio.stdio_client` verified directly and via `node packaging/mcpb/launcher.mjs`, headless Chromium verified `pea-viewer` at `1280px` & `390px` with zero overflow/errors/external requests, clean local commit on `main` (no remote push). |
 | 2026-11-22 | Phase 3 | Completed pre-benchmark hardening (`resolve_browser_executable()` fallbacks in `engine.py`/`pdf_builder.py`, bundled Noto Sans Cyrillic overlay font in `render_annotated_overlay`, `latest_screenshot_relpath` path confinement in `viewer/app.py`), fixed 5 real bugs surfaced by live dual-lab E2E (OCR box-split decimal separator `-67 ,86`, Flex AS3 dot-decimal `decimal_comma=False` input semantics, `mcp_server.py` logical prefix `profiles/` round-trip resolution, multi-session/multi-search SHA-256 provenance immutability via unique capture seq + `readings/*.json`, and `report.css` block `break-after: avoid` eliminating orphaned Q&A headers), implemented live dual-lab E2E benchmarks (`tests/e2e/test_lab5_e2e.py` + `tests/e2e/test_lab4_e2e.py`) over real `pea-mcp` stdio, visually inspected every rendered PDF page (9 Lab 5 pages + 5 Lab 4 pages), audited `dist/pea-mcp-0.2.0.mcpb`, and verified `pea-viewer` at `1280×800` & `390×844` on the real Phase 3 benchmark runs. | `132/132` offline tests + `2/2` live dual-lab E2E benchmarks pass (full `pytest` `134/134`), Lab 5 reproduces all 4 exact plateaus (`[2445,2472]`, `[2427,2444]`, `[2361,2434]` 74-step, `[2333,2370]`, `w0/dw` slope `3.849`, `301` verified artifacts), Lab 4 achieves `72/72` exact repeatability match + `< 0.5%` $\mu_0$ deviation (`96` verified artifacts), `.venv/bin/ruff check src/ tests/ scripts/` clean (`0` errors), `scripts/build_mcpb.py --check` passed, tracked-file home-path hygiene audit returned `0` matches, `pea-viewer` verified at `1280×800` & `390×844` (`0` overflow/errors/external requests), clean local commit on `main` (no remote push). |
+| 2026-11-24 | Milestone 2 (`M2A`–`M2D`) | Delivered `v0.3.0` (`18` universal tools): frozen `WatchSpec`/`WatchResult`/`ComputeSimSpec`/`ComputeSimResult` schemas (`M2A`); deterministic HTML5/URL SHA-256 fingerprinting and drift-compensated hybrid `sim_watch` engine (`burst_post_ocr` + `inline_ocr` stability/threshold early stops, atomic `O_CREAT \| O_EXCL` evidence/readings, `simulator_captured` dataset export) (`M2B`); sandboxed zero-`eval`/`exec` `compute_sim` engine (`ode_ivp` `RK45`/`Radau`/`BDF`, `algebraic_grid` with lazy-branch `where()`, inline & dataset-backed `fft_spectrum` with Hann coherent gain + automatic jitter resampling, atomic `os.link` `data_ingest`, unconditionally `model_computed`) (`M2C`); MCP tools `#17–#18` + `sim_open` `sim_sha256` + orphan-run cleanup, minimal `pea-viewer` **Datasets & Model Outputs** table with provenance pills & confined defensive JSON reader, `dist/pea-mcp-0.3.0.mcpb`, updated `SKILL.md`/`README.md`, deterministic zero-network HTML5 RC/RLC fixture (`tests/fixtures/html5_rc_sim/index.html`), and live transient E2E benchmark (`tests/e2e/test_transient_m2_e2e.py`) (`M2D`). | `206/206` offline tests + `3/3` live E2E benchmarks pass (full `pytest` `209/209`, `0` skipped); live HTML5 transient benchmark recovers RC $\tau = 1.0003\text{ s}$ vs $1.0000\text{ s}$ (`0.03%` dev, $R^2 = 1.0000$, max RK45 ODE residual `0.029 V` across 17 frames) and damped RLC FFT peak $f_{\text{peak}} = 1.974\text{ Hz}$ vs $2.000\text{ Hz}$ (`1.32%` dev across 76 frames, `resampled=True`, `113` SHA-256 verified artifacts); all 4 rendered transient PDF preview PNGs visually inspected; `pea-viewer` verified in headless Chromium at `1280×800` & `390×844` (`0` overflow/errors/external requests, all 4 datasets with `simulator_captured` & `model_computed` pills); `ruff check src/ tests/ scripts/` clean (`0` errors); `scripts/build_mcpb.py --check` passed for `v0.3.0` (`18` tools); tracked-file home-path audit `0` matches. |

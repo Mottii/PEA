@@ -1,24 +1,35 @@
-"""Milestone 2 typed simulator extension stubs (``sim_watch`` and ``compute_sim``)."""
+"""Milestone 2 typed simulator extensions (``sim_watch`` and ``compute_sim``)."""
 
 from __future__ import annotations
 
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any
 
-from pea.schemas import ComputeSimSpec, WatchSpec
+from pea.math_engine.compute_sim import run_compute_sim
+from pea.schemas import ComputeSimResult, ComputeSimSpec, WatchResult, WatchSpec
 
-
-async def sim_watch(spec: WatchSpec, *args: Any, **kwargs: Any) -> NoReturn:
-    """Timed transient / stopwatch capture stub scheduled for Milestone 2."""
-    if not isinstance(spec, WatchSpec):
-        WatchSpec.model_validate(spec)
-    raise NotImplementedError("sim_watch is scheduled for Milestone 2")
+if TYPE_CHECKING:
+    from pea.sim.engine import SimulatorSession
+    from pea.workspace import RunWorkspace
 
 
-def compute_sim(spec: ComputeSimSpec, *args: Any, **kwargs: Any) -> NoReturn:
-    """Sandboxed numerical/ODE modeling stub scheduled for Milestone 2."""
-    if not isinstance(spec, ComputeSimSpec):
-        ComputeSimSpec.model_validate(spec)
-    raise NotImplementedError("compute_sim is scheduled for Milestone 2")
+async def sim_watch(
+    session: SimulatorSession,
+    spec: WatchSpec | dict[str, Any],
+) -> WatchResult:
+    """Run timed transient / stopwatch capture via ``session.watch(spec)``."""
+    validated = spec if isinstance(spec, WatchSpec) else WatchSpec.model_validate(spec)
+    return await session.watch(validated)
+
+
+def compute_sim(
+    spec: ComputeSimSpec | dict[str, Any],
+    run_workspace: RunWorkspace,
+) -> ComputeSimResult:
+    """Run sandboxed numerical, ODE, or FFT modeling via ``run_compute_sim``."""
+    validated = (
+        spec if isinstance(spec, ComputeSimSpec) else ComputeSimSpec.model_validate(spec)
+    )
+    return run_compute_sim(validated, run_workspace=run_workspace)
 
 
 __all__ = [

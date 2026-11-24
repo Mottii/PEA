@@ -1,6 +1,6 @@
 ---
 name: pea-lab-assistant
-description: Universal physics laboratory assistant workflow for the zero-API-cost pea-mcp server. Guides PDF handout inspection, team/variant confirmation, SHA-256 simulator calibration, verified data acquisition (sweeps and extremum/plateau searches), dimensional physics math, vector plots/schematics, submission-ready PDF/DOCX compilation, and visual QA.
+description: Universal physics laboratory assistant workflow for the zero-API-cost pea-mcp server. Guides PDF handout inspection, team/variant confirmation, SHA-256 simulator calibration, verified data acquisition (sweeps, extremum/plateau searches, and timed transient capture), dimensional physics math, sandboxed ODE/FFT modeling, vector plots/schematics, submission-ready PDF/DOCX compilation, and visual QA.
 ---
 
 # PEA v2 Lab Assistant Skill
@@ -55,21 +55,30 @@ Before acquiring data or compiling the final report, confirm with the user:
      4. Always define an inert **`blur_xy`** (e.g., on the fixed top header bar) so blinking text carets (`|`) are dismissed before OCR capture.
      5. Persist and live-verify via **`sim_save_profile(session_id, profile, verify_live=True)`**.
 
-### Stage 4 — Verified Data Acquisition (`sim_sweep`, `sim_search_extremum`, or `data_ingest`)
+### Stage 4 — Verified Data Acquisition (`sim_sweep`, `sim_search_extremum`, `sim_watch`, or `data_ingest`)
 - **N-dimensional parameter grids:** Call **`sim_sweep(session_id, spec=SweepSpec(...))`** with `verify_controls=True` and `blur_before_capture=True`. Inspect `controls_matched_all` and `missing_readouts`.
 - **Peaks, minima, thresholds, or wide discrete plateaus:** Call **`sim_search_extremum(session_id, spec=SearchSpec(...))`**:
   - For resonance plateaus where discrete readouts remain tied across many steps (e.g., 50–80+ steps), use `mode="plateau_max"`, set `max_steps >= 120`, and set `stop_after_drop >= 2`.
   - Use the returned `PlateauResult` (`low_bound`, `high_bound`, `midpoint`, `peak_value`, `width_steps`, `boundary_screenshots`, `trace`).
+- **Timed transients & stopwatches:** Call **`sim_watch(session_id, spec=WatchSpec(...))`**:
+  - Uses hybrid pacing automatically: drift-compensated **`burst_post_ocr`** (lowest timing jitter) by default, switching to **`inline_ocr`** whenever early-stop rules (`stop_when_stable_s` / `stability_tol` or threshold `stop_readout` / `stop_op` / `stop_value`) are specified.
+  - Supports `trigger_action` or multi-step `trigger_actions` (e.g., mode select → Reset → Start), `fixed_controls`, `settle_ms`, `blur_before_capture`, and safety cap `max_frames` (default `500`, cap `2000`).
+  - Records both monotonic `elapsed_s` and any calibrated in-sim stopwatch readout, hashes every frame in `provenance.jsonl`, and auto-saves a `simulator_captured` dataset (`save_dataset=True`, optional `dataset_id`) ready for `data_analyze` or `compute_sim(model_kind="fft_spectrum")`.
 - **Physical bench measurements:** Ingest CSV/JSON or inline rows via **`data_ingest(run_id=..., source="bench_manual", ...)`**.
 - Always close finished browser sessions cleanly with **`sim_close(session_id)`**.
 
-### Stage 5 — Deterministic Data Analysis & Physics Math (`data_ingest`, `data_analyze`, `calc_eval`)
-1. Ingest simulator readings into a structured dataset via **`data_ingest(run_id=..., source="simulator_captured", rows=..., units=...)`**.
+### Stage 5 — Deterministic Data Analysis & Physics Math (`data_ingest`, `data_analyze`, `calc_eval`, `compute_sim`)
+1. Ingest simulator readings into a structured dataset via **`data_ingest(run_id=..., source="simulator_captured", rows=..., units=...)`** (or reuse the auto-saved dataset from `sim_watch`).
 2. Call **`data_analyze`** to compute:
-   - Safe AST derived columns (e.g., `1/r`, `(R**2 + r**2)**(-1.5)`, `(w1 + w2)/2`, `w0 / dw`, `Q**2`).
+   - Safe AST derived columns (e.g., `1/r`, `(R**2 + r**2)**(-1.5)`, `(w1 + w2)/2`, `w0 / dw`, `Q**2`, `log(Vc)`).
    - Explicit **`intercept="free"`** or **`intercept="zero"`** OLS regressions (recording `slope`, `slope_se`, `intercept`, `intercept_se`, `r_squared`, `n_points`).
    - Reference `comparisons` (`abs_diff`, `percent_deviation`).
 3. Call **`calc_eval(..., run_id=run_id)`** for every derived physical quantity, theoretical reference, complex AC impedance, vector calculation, and Gaussian uncertainty propagation. Record every returned **`calc_id`** for citation in `ReportSpec`.
+4. Call **`compute_sim(run_id=run_id, spec=ComputeSimSpec(...))`** for sandboxed zero-`eval`/`exec` numerical modeling:
+   - **`ode_ivp`**: 1D or coupled N-D ODE initial-value problems (`RK45`, `Radau`, `BDF` with `rtol`, `atol`, `max_nfev`, `timeout_s`) to generate theoretical transient curves for direct comparison against `sim_watch` captures.
+   - **`algebraic_grid`**: vectorized 1D or multi-expression theoretical curves over uniform grids (including lazy-branch `where(cond, a, b)`).
+   - **`fft_spectrum`**: one-sided amplitude/power/phase spectra from either an existing run dataset (`input_dataset_id`, `time_column`, `signal_column` with automatic jitter resampling when spacing jitter `> 1%`) or an inline expression, with optional `window="hann"` (coherent amplitude gain) and `detrend_mean=True`.
+   - Every `compute_sim` dataset is **unconditionally tagged `provenance="model_computed"`** — never relabel model outputs as `simulator_captured`.
 
 ### Stage 6 — Publication-Grade Vector Visuals (`plot_render`, `diagram_render`)
 - Call **`plot_render`** to generate vector `.svg` + 300 DPI `.png` plots (linearized fits with regression annotations, resonance curves, error bars, or `equal_aspect=True` phase portraits such as $q$–$I$ ellipses).
@@ -90,7 +99,7 @@ Call **`report_build(run_id=..., spec=ReportSpec(...), formats=..., include_teac
 
 ---
 
-## Tool Reference (`pea-mcp` — 16 Universal Tools + 1 Resource)
+## Tool Reference (`pea-mcp` — 18 Universal Tools + 1 Resource)
 
 | Category | Name | Purpose |
 | :--- | :--- | :--- |
@@ -103,10 +112,12 @@ Call **`report_build(run_id=..., spec=ReportSpec(...), formats=..., include_teac
 | **Simulator** | `sim_save_profile` | Live-verify and save SHA-256 `CalibrationProfile` |
 | **Simulator** | `sim_sweep` | Deterministic N-D grid sweep with OCR control verification |
 | **Simulator** | `sim_search_extremum` | Closed-loop `max`, `min`, `plateau_max`, or `threshold` search |
+| **Simulator** | `sim_watch` | Drift-compensated timed transient/stopwatch capture (`burst_post_ocr` or `inline_ocr`) |
 | **Simulator** | `sim_close` | Close Playwright session & stop loopback server |
 | **Math & Data** | `data_ingest` | Ingest inline rows or confined CSV/JSON with explicit provenance source |
 | **Math & Data** | `data_analyze` | Safe AST column transforms, free/zero-intercept OLS, % deviations |
 | **Math & Data** | `calc_eval` | Safe 5-dim SI dimensional calculator (complex, 3D vectors, uncertainties) |
+| **Math & Data** | `compute_sim` | Sandboxed zero-eval ODE IVP (`RK45`/`Radau`/`BDF`), algebraic grid, & FFT (`model_computed`) |
 | **Visuals** | `plot_render` | Headless Matplotlib vector SVG + 300 DPI PNG scientific plots |
 | **Visuals** | `diagram_render` | `schemdraw` circuits and parametric phasor/waveform/field SVGs |
 | **Reports** | `report_build` | Offline HTML+KaTeX → A4 PDF, editable DOCX, `evidence.zip`, Teacher PDF |
@@ -120,3 +131,4 @@ Call **`report_build(run_id=..., spec=ReportSpec(...), formats=..., include_teac
 - **Flex stepper boundary clamping:** When calibrating `step_interior` steppers, verify both `min_val` and `max_val` endpoints (`compute_stepper_plan` automatically approaches `max_val` from below with `target - step` + `up_xy`).
 - **Unit scaling & Cyrillic↔Latin homoglyphs:** Keep `normalize_homoglyphs=True` and explicit `unit_pattern` on readouts so `мкТл` vs `мТл` or `мкФ` vs `пФ` are never conflated; always preserve negative signs.
 - **Wide discrete plateaus:** Do not stop at the first tie during resonance searches — use `mode="plateau_max"` with sufficient `max_steps` so the full plateau `[low_bound, high_bound]` and its midpoint are captured with boundary screenshots.
+- **Timed watch stability vs. ticking stopwatches:** When using `stop_when_stable_s`, watch only settling channel(s) (relying on monotonic `elapsed_s`) or use threshold stop (`stop_readout`/`stop_op`/`stop_value`), because an incrementing in-sim stopwatch readout never stays constant. Any OCR miss (`None`) resets the stability window and never triggers a false stop.

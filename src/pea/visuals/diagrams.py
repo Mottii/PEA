@@ -193,7 +193,7 @@ def _render_circuit(spec: DiagramSpec, fig: Figure) -> None:
     ax.set_axis_off()
 
     if spec.title:
-        ax.set_title(spec.title, fontsize=11.5, fontweight="bold", pad=12)
+        ax.set_title(spec.title, fontsize=11.5, fontweight="bold", pad=24)
     if spec.notes:
         fig.text(
             0.5,

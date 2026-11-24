@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import csv
+import errno
 import json
 import math
 import os
@@ -247,19 +248,41 @@ def data_ingest(
     datasets_dir.mkdir(parents=True, exist_ok=True)
     relpath = f"datasets/{resolved_id}.json"
     target_path = run_workspace.resolve_path(relpath)
+    exists_msg = (
+        f"Dataset {resolved_id!r} already exists in run {run_workspace.run_id}; "
+        "use a unique dataset_id to preserve provenance immutability"
+    )
     if target_path.exists():
-        raise FileExistsError(
-            f"Dataset {resolved_id!r} already exists in run {run_workspace.run_id}; "
-            "use a unique dataset_id to preserve provenance immutability"
-        )
+        raise FileExistsError(exists_msg)
 
-    tmp_path = run_workspace.resolve_path(f"datasets/{resolved_id}.json.tmp")
     payload = final_ds.model_dump_json(indent=2) + "\n"
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp_path, target_path)
+    tmp_path = run_workspace.resolve_path(
+        f"datasets/.{resolved_id}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+    )
+    try:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            # Atomic non-overwriting publish: fails with FileExistsError if another
+            # thread/process claimed target_path concurrently, while ensuring readers
+            # never observe a partially written JSON file.
+            os.link(tmp_path, target_path)
+        except FileExistsError as exc:
+            raise FileExistsError(exists_msg) from exc
+        except OSError as exc:
+            if exc.errno not in (errno.EXDEV, errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP):
+                raise
+            try:
+                with target_path.open("xb") as handle:
+                    handle.write(payload.encode("utf-8"))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except FileExistsError as fex:
+                raise FileExistsError(exists_msg) from fex
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
     run_workspace.record_artifact(
         relpath,

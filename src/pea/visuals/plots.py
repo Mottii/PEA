@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg", force=True)
 
@@ -280,25 +281,14 @@ def render_plot(
                 )
 
             if plot_spec.annotations:
-                ann_x, ann_y, ann_ha, ann_va = 0.025, 0.97, "left", "top"
-                if legend_obj is not None:
-                    # Inspect resolved legend position to avoid overlapping top-left annotations
-                    FigureCanvasAgg(fig)
-                    fig.canvas.draw()
-                    renderer = fig.canvas.get_renderer()  # type: ignore[attr-defined]
-                    leg_bbox = legend_obj.get_window_extent(renderer).transformed(
-                        ax.transAxes.inverted()
-                    )
-                    if leg_bbox.x0 < 0.45 and leg_bbox.y1 > 0.65:
-                        ann_x, ann_y, ann_ha, ann_va = 0.975, 0.03, "right", "bottom"
                 annotation_text = "\n".join(plot_spec.annotations)
-                ax.text(
-                    ann_x,
-                    ann_y,
+                ann_artist = ax.text(
+                    0.025,
+                    0.97,
                     annotation_text,
                     transform=ax.transAxes,
-                    va=ann_va,
-                    ha=ann_ha,
+                    va="top",
+                    ha="left",
                     fontsize=8.6,
                     color="#0f172a",
                     bbox={
@@ -309,6 +299,90 @@ def render_plot(
                     },
                     zorder=5,
                 )
+                FigureCanvasAgg(fig)
+                fig.canvas.draw()
+                renderer = fig.canvas.get_renderer()  # type: ignore[attr-defined]
+                inv_axes = ax.transAxes.inverted()
+                ann_bbox = ann_artist.get_window_extent(renderer).transformed(inv_axes)
+                ann_w = float(ann_bbox.width)
+                ann_h = float(ann_bbox.height)
+
+                leg_bbox = (
+                    legend_obj.get_window_extent(renderer).transformed(inv_axes)
+                    if legend_obj is not None
+                    else None
+                )
+
+                # Project series points (capped stride for large curves) into axes-fraction coords
+                sample_coords: list[tuple[float, float]] = []
+                for series in plot_spec.series:
+                    if not series.x:
+                        continue
+                    stride = max(1, len(series.x) // 256)
+                    xs = np.asarray(series.x[::stride], dtype=np.float64)
+                    ys = np.asarray(series.y[::stride], dtype=np.float64)
+                    if stride > 1 and len(series.x) > 1:
+                        xs = np.append(xs, float(series.x[-1]))
+                        ys = np.append(ys, float(series.y[-1]))
+                    pts = np.column_stack([xs, ys])
+                    ax_pts = inv_axes.transform(ax.transData.transform(pts))
+                    for px, py in ax_pts:
+                        sample_coords.append((float(px), float(py)))
+                    if series.kind == "line" and len(ax_pts) >= 2:
+                        for i in range(len(ax_pts) - 1):
+                            x0_s, y0_s = float(ax_pts[i, 0]), float(ax_pts[i, 1])
+                            x1_s, y1_s = float(ax_pts[i + 1, 0]), float(ax_pts[i + 1, 1])
+                            for frac in (0.25, 0.5, 0.75):
+                                sample_coords.append(
+                                    (x0_s + frac * (x1_s - x0_s), y0_s + frac * (y1_s - y0_s))
+                                )
+
+                candidates: list[tuple[float, float, str, str]] = [
+                    (0.025, 0.97, "left", "top"),
+                    (0.025, 0.035, "left", "bottom"),
+                    (0.975, 0.97, "right", "top"),
+                    (0.975, 0.035, "right", "bottom"),
+                ]
+                if leg_bbox is not None and leg_bbox.y0 > ann_h + 0.08:
+                    below_y = float(leg_bbox.y0) - 0.035
+                    if leg_bbox.x0 + leg_bbox.x1 >= 1.0:
+                        candidates.append((0.975, below_y, "right", "top"))
+                    else:
+                        candidates.append((0.025, below_y, "left", "top"))
+
+                best_score: tuple[int, int, int] | None = None
+                best_pos = candidates[0]
+                margin = 0.02
+                for idx_cand, (cx, cy, cha, cva) in enumerate(candidates):
+                    bx0 = cx if cha == "left" else cx - ann_w
+                    bx1 = cx + ann_w if cha == "left" else cx
+                    by0 = cy if cva == "bottom" else cy - ann_h
+                    by1 = cy + ann_h if cva == "bottom" else cy
+
+                    leg_overlap = 0
+                    if leg_bbox is not None:
+                        if not (
+                            bx1 + margin < leg_bbox.x0
+                            or bx0 - margin > leg_bbox.x1
+                            or by1 + margin < leg_bbox.y0
+                            or by0 - margin > leg_bbox.y1
+                        ):
+                            leg_overlap = 1
+
+                    data_hits = sum(
+                        1
+                        for px, py in sample_coords
+                        if (bx0 - margin) <= px <= (bx1 + margin)
+                        and (by0 - margin) <= py <= (by1 + margin)
+                    )
+                    score = (leg_overlap, data_hits, idx_cand)
+                    if best_score is None or score < best_score:
+                        best_score = score
+                        best_pos = (cx, cy, cha, cva)
+
+                ann_artist.set_position((best_pos[0], best_pos[1]))
+                ann_artist.set_ha(best_pos[2])
+                ann_artist.set_va(best_pos[3])
 
             fig.tight_layout()
             _save_figure_dual(fig, svg_path, png_path, dpi=plot_spec.dpi)

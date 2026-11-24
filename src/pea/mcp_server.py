@@ -1,6 +1,6 @@
 """PEA v2 universal MCP stdio server built on ``mcp.server.mcpserver.MCPServer`` (mcp==2.3.0).
 
-Exposes 16 deterministic, zero-API-cost laboratory tools plus the read-only ``pea://policy``
+Exposes 18 deterministic, zero-API-cost laboratory tools plus the read-only ``pea://policy``
 resource. Zero LLM API calls, zero arbitrary shell/filesystem tools, strict path confinement,
 and ``extra="forbid"`` validation on every tool input schema.
 """
@@ -11,6 +11,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import sys
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
@@ -40,6 +41,12 @@ from pea.math_engine.calculator import (
 from pea.math_engine.calculator import (
     calc_eval as _calc_eval,
 )
+from pea.math_engine.compute_sim import (
+    ComputeSimError,
+)
+from pea.math_engine.compute_sim import (
+    run_compute_sim as _run_compute_sim,
+)
 from pea.pdf_intake import PdfInspectionResult, inspect_pdf
 from pea.schemas import (
     ActionStep,
@@ -49,6 +56,7 @@ from pea.schemas import (
     CalcVariable,
     CalibrationProfile,
     ComparisonSpec,
+    ComputeSimSpec,
     DatasetSpec,
     DerivedColumnSpec,
     DiagramSpec,
@@ -62,6 +70,7 @@ from pea.schemas import (
     ReportSpec,
     SearchSpec,
     SweepSpec,
+    WatchSpec,
 )
 from pea.sim.engine import SimCancelledError, SimulatorManager, _origin_matches_allowlist
 from pea.sim.swf_meta import SwfFormatError
@@ -80,10 +89,12 @@ UNIVERSAL_TOOL_NAMES: tuple[str, ...] = (
     "sim_save_profile",
     "sim_sweep",
     "sim_search_extremum",
+    "sim_watch",
     "sim_close",
     "data_ingest",
     "data_analyze",
     "calc_eval",
+    "compute_sim",
     "plot_render",
     "diagram_render",
     "report_build",
@@ -245,6 +256,7 @@ def _raise_tool_error(exc: Exception, config: PeaConfig) -> NoReturn:
         (
             CalcError,
             AnalysisError,
+            ComputeSimError,
             SwfFormatError,
             KeyError,
             ValueError,
@@ -276,36 +288,33 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
 
 
 def _collect_run_artifacts(workspace: RunWorkspace) -> dict[str, list[str]]:
-    datasets: list[str] = []
-    datasets_dir = workspace.root / "datasets"
-    if datasets_dir.is_dir():
-        datasets = sorted(
-            p.relative_to(workspace.root).as_posix()
-            for p in datasets_dir.glob("*.json")
-            if p.is_file() and not p.name.endswith(".tmp")
-        )
+    def _confined_files(subdir: str, suffixes: tuple[str, ...]) -> list[str]:
+        try:
+            resolved_dir = workspace.resolve_path(subdir)
+        except PathConfinementError:
+            return []
+        if not resolved_dir.is_dir():
+            return []
+        results: list[str] = []
+        for item in sorted(resolved_dir.iterdir(), key=lambda p: p.name):
+            if item.name.startswith(".") or item.name.endswith(".tmp"):
+                continue
+            if item.suffix.lower() not in suffixes:
+                continue
+            rel = f"{subdir}/{item.name}"
+            try:
+                resolved_item = workspace.resolve_path(rel)
+            except PathConfinementError:
+                continue
+            if resolved_item.is_file():
+                results.append(rel)
+        return results
 
-    figures: list[str] = []
-    if workspace.figures_dir.is_dir():
-        figures = sorted(
-            p.relative_to(workspace.root).as_posix()
-            for p in workspace.figures_dir.iterdir()
-            if p.is_file()
-            and p.suffix.lower() in (".svg", ".png")
-            and not p.name.endswith(".tmp")
-        )
-
-    reports: list[str] = []
-    if workspace.reports_dir.is_dir():
-        reports = sorted(
-            p.relative_to(workspace.root).as_posix()
-            for p in workspace.reports_dir.iterdir()
-            if p.is_file()
-            and p.suffix.lower() in (".pdf", ".docx", ".zip")
-            and not p.name.endswith(".tmp")
-        )
-
-    return {"datasets": datasets, "figures": figures, "reports": reports}
+    return {
+        "datasets": _confined_files("datasets", (".json",)),
+        "figures": _confined_files("figures", (".svg", ".png")),
+        "reports": _confined_files("reports", (".pdf", ".docx", ".zip")),
+    }
 
 
 def build_policy_payload(config: PeaConfig) -> dict[str, Any]:
@@ -366,7 +375,7 @@ def create_mcp_server(
     workspace_manager: WorkspaceManager | None = None,
     sim_manager: SimulatorManager | None = None,
 ) -> MCPServer[PeaServerRuntime]:
-    """Create and configure the ``pea-mcp`` ``MCPServer`` with all 16 tools and ``pea://policy``."""
+    """Create and configure the ``pea-mcp`` ``MCPServer`` with all 18 tools and ``pea://policy``."""
     runtime = PeaServerRuntime(
         config=config,
         workspace_manager=workspace_manager,
@@ -412,7 +421,7 @@ def create_mcp_server(
         title="PEA v2 Security & Scientific Integrity Policy",
         description=(
             "Read-only runtime policy covering zero-API-cost operation, loopback sandboxing, "
-            "path confinement, provenance separation, and the 16 universal tools."
+            "path confinement, provenance separation, and the 18 universal tools."
         ),
         mime_type="application/json",
         annotations=Annotations(audience=["assistant", "user"], priority=1.0),
@@ -567,7 +576,7 @@ def create_mcp_server(
             _raise_tool_error(exc, cfg)
 
     # ------------------------------------------------------------------
-    # Group 2: Universal Simulator (7 tools)
+    # Group 2: Universal Simulator (8 tools)
     # ------------------------------------------------------------------
 
     @server.tool(
@@ -655,6 +664,7 @@ def create_mcp_server(
                 "stage_width": session.stage_width,
                 "stage_height": session.stage_height,
                 "header_height_px": session.header_height_px,
+                "sim_sha256": session.sim_sha256,
                 "swf_meta": swf_meta_payload,
                 "profile_loaded": session.profile is not None,
                 "profile": (
@@ -892,6 +902,43 @@ def create_mcp_server(
             _raise_tool_error(exc, cfg)
 
     @server.tool(
+        name="sim_watch",
+        title="Watch Timed Simulator Transient",
+        description=(
+            "Execute a drift-compensated timed transient or stopwatch capture (hybrid "
+            "burst_post_ocr or inline_ocr with threshold/stability early stops), logging "
+            "SHA-256 frames, readings, and optional simulator_captured datasets."
+        ),
+        annotations=ToolAnnotations(
+            title="Watch Timed Simulator Transient",
+            read_only_hint=False,
+            destructive_hint=False,
+            idempotent_hint=False,
+            open_world_hint=False,
+        ),
+    )
+    async def sim_watch(
+        session_id: str,
+        spec: WatchSpec,
+    ) -> dict[str, Any]:
+        try:
+            session = runtime.sim_manager.get_session(session_id)
+            result = await session.watch(spec)
+            if result.points and session.workspace.status_path.is_file():
+                session.workspace.update_status(
+                    metadata_updates={
+                        "latest_screenshot_relpath": result.points[-1].screenshot_relpath,
+                    }
+                )
+            return {
+                "session_id": session.session_id,
+                "run_id": session.workspace.run_id,
+                **result.model_dump(mode="json"),
+            }
+        except Exception as exc:
+            _raise_tool_error(exc, cfg)
+
+    @server.tool(
         name="sim_close",
         title="Close Simulator Session",
         description=(
@@ -919,7 +966,7 @@ def create_mcp_server(
             _raise_tool_error(exc, cfg)
 
     # ------------------------------------------------------------------
-    # Group 3: Math & Data (3 tools)
+    # Group 3: Math & Data (4 tools)
     # ------------------------------------------------------------------
 
     @server.tool(
@@ -1090,6 +1137,58 @@ def create_mcp_server(
             )
             return _calc_eval(request, workspace=workspace)
         except Exception as exc:
+            _raise_tool_error(exc, cfg)
+
+    @server.tool(
+        name="compute_sim",
+        title="Run Sandboxed Numerical / ODE / FFT Model",
+        description=(
+            "Evaluate a zero-eval/exec sandboxed ODE IVP (RK45/Radau/BDF), algebraic grid, "
+            "or one-sided FFT spectrum (inline or dataset-backed with Hann windowing and "
+            "jitter resampling), persisting an immutable model_computed dataset."
+        ),
+        annotations=ToolAnnotations(
+            title="Run Sandboxed Numerical / ODE / FFT Model",
+            read_only_hint=False,
+            destructive_hint=False,
+            idempotent_hint=False,
+            open_world_hint=False,
+        ),
+    )
+    def compute_sim(
+        spec: ComputeSimSpec,
+        run_id: str | None = None,
+        label: str | None = None,
+    ) -> dict[str, Any]:
+        created_workspace: RunWorkspace | None = None
+        try:
+            validated = (
+                spec if isinstance(spec, ComputeSimSpec) else ComputeSimSpec.model_validate(spec)
+            )
+            if validated.input_dataset_id is not None and run_id is None:
+                raise ValueError("run_id is required when input_dataset_id is specified")
+
+            if run_id is not None:
+                workspace = runtime.workspace_manager.get_run(run_id)
+            else:
+                workspace = runtime.workspace_manager.create_run(
+                    label=label,
+                    source="model_computed",
+                )
+                created_workspace = workspace
+
+            result = _run_compute_sim(validated, run_workspace=workspace)
+            return {
+                "run_id": workspace.run_id,
+                **result.model_dump(mode="json"),
+            }
+        except Exception as exc:
+            if created_workspace is not None:
+                try:
+                    if not created_workspace.read_provenance():
+                        shutil.rmtree(created_workspace.root, ignore_errors=True)
+                except Exception:
+                    pass
             _raise_tool_error(exc, cfg)
 
     # ------------------------------------------------------------------

@@ -2,9 +2,9 @@
   "manifest_version": "0.3",
   "name": "pea-mcp",
   "display_name": "PEA — Physics Experiments Automation",
-  "version": "0.2.0",
-  "description": "Zero-API-cost deterministic physics lab simulator control, offline ONNX OCR, dimensional math, OLS analysis, vector plots/schematics, and academic PDF/DOCX report compiler.",
-  "long_description": "PEA v2 connects Claude Desktop to a local Python 3.13 PEA workspace over MCP stdio with zero LLM API calls and zero API keys required. Exposes 16 universal laboratory tools and the read-only pea://policy resource.",
+  "version": "0.3.0",
+  "description": "Zero-API-cost deterministic physics lab simulator control, timed transient capture, offline ONNX OCR, dimensional math, OLS analysis, sandboxed ODE/FFT modeling, vector plots/schematics, and academic PDF/DOCX report compiler.",
+  "long_description": "PEA v2 connects Claude Desktop to a local Python 3.13 PEA workspace over MCP stdio with zero LLM API calls and zero API keys required. Exposes 18 universal laboratory tools and the read-only pea://policy resource.",
   "author": {
     "name": "PEA Contributors"
   },
@@ -89,6 +89,10 @@
       "description": "Run closed-loop max, min, wide plateau_max, or threshold searches with boundary screenshots."
     },
     {
+      "name": "sim_watch",
+      "description": "Execute drift-compensated timed transient or stopwatch capture (burst_post_ocr or inline_ocr) with SHA-256 frames and dataset export."
+    },
+    {
       "name": "sim_close",
       "description": "Close an active simulator session and stop its loopback server."
     },
@@ -103,6 +107,10 @@
     {
       "name": "calc_eval",
       "description": "Evaluate safe 5-dim SI dimensional expressions (complex AC, 3D vectors, uncertainties)."
+    },
+    {
+      "name": "compute_sim",
+      "description": "Run sandboxed zero-eval ODE IVP (RK45/Radau/BDF), algebraic grid, or one-sided FFT modeling tagged model_computed."
     },
     {
       "name": "plot_render",

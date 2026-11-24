@@ -10,7 +10,7 @@ PEA makes **zero LLM API calls** and requires **no API keys**. Any connecting ho
 
 - **Zero API Cost:** Strictly zero paid AI/LLM API calls and zero API keys required.
 - **Loopback-Only by Default (`127.0.0.1`):** Local SWF and HTML5 simulators run on loopback with Ruffle `allowScriptAccess: false` and `allowNetworking: "none"`. External HTML5 simulator domains are blocked unless explicitly allowlisted via `PEA_ALLOWED_ORIGINS`.
-- **Zero Arbitrary Shell / Filesystem Tools:** `pea-mcp` exposes only 16 typed domain tools plus the read-only `pea://policy` resource. All schemas enforce `extra="forbid"` (`additionalProperties: false`), and all file inputs/outputs are strictly confined to project/run roots (rejecting `..` traversal and symlink escapes).
+- **Zero Arbitrary Shell / Filesystem Tools:** `pea-mcp` exposes only 18 typed domain tools plus the read-only `pea://policy` resource. All schemas enforce `extra="forbid"` (`additionalProperties: false`), and all file inputs/outputs are strictly confined to project/run roots (rejecting `..` traversal and symlink escapes).
 - **Read-Only Hardened Viewer:** `pea-viewer` binds strictly to loopback (`127.0.0.1:5190`), enforces anti-DNS-rebinding `Host` and same-origin `Origin` checks, rejects non-`GET`/`HEAD` methods, serves strict CSP + `X-Content-Type-Options: nosniff`, and confines `/runs/{run_id}/{artifact}` reads.
 - **Scientific Honesty & Provenance Separation:** Datasets, tables, and figures explicitly distinguish `simulator_captured`, `bench_manual`, and `model_computed` sources. Missing simulator readings are never back-filled from equations, and partial evidence is preserved on failure or cancellation.
 
@@ -50,10 +50,10 @@ Build and audit the unsigned local bundle (requires Node.js `>=18` for the zero-
 
 ```sh
 .venv/bin/python scripts/build_mcpb.py
-# Produces audited dist/pea-mcp-0.2.0.mcpb (~9 KB, zero binaries/SWFs/PDFs/secrets)
+# Produces audited dist/pea-mcp-0.3.0.mcpb (~10 KB, zero binaries/SWFs/PDFs/secrets)
 ```
 
-Install `dist/pea-mcp-0.2.0.mcpb` in Claude Desktop and set **PEA Project Folder** to your local PEA checkout path (containing `.venv/` and `local_assets/`).
+Install `dist/pea-mcp-0.3.0.mcpb` in Claude Desktop and set **PEA Project Folder** to your local PEA checkout path (containing `.venv/` and `local_assets/`).
 
 ### Option B — Standard MCP `stdio` JSON Config (Claude Desktop / Cursor / Antigravity / Codex)
 
@@ -93,12 +93,13 @@ Start the lightweight Starlette viewer on loopback (`http://127.0.0.1:5190`):
 Features:
 - Responsive desktop (`1280px`) and mobile (`390px`) layout with zero external CDN requests.
 - Latest capture preview with interactive **OCR Box Overlay** toggle and annotated PNG toggle.
+- **Datasets & Model Outputs** table displaying `simulator_captured`, `bench_manual`, and `model_computed` provenance pills, row counts, columns, notes, and JSON download links.
 - Live **SHA-256 Provenance Verification** badge and ledger inspection.
 - One-click downloads for compiled **Report PDF**, **Editable DOCX**, **Evidence ZIP**, and **Teacher Evidence PDF**.
 
 ---
 
-## Universal MCP Surface (`16` Tools + `pea://policy`)
+## Universal MCP Surface (`18` Tools + `pea://policy`)
 
 | Category | Name | Description |
 | :--- | :--- | :--- |
@@ -111,10 +112,12 @@ Features:
 | **Simulator** | `sim_save_profile` | Live-verify and save SHA-256 `CalibrationProfile` |
 | **Simulator** | `sim_sweep` | Deterministic N-D parameter grid sweep with OCR verification |
 | **Simulator** | `sim_search_extremum` | Closed-loop `max`, `min`, wide `plateau_max`, or `threshold` search |
+| **Simulator** | `sim_watch` | Drift-compensated timed transient/stopwatch capture (`burst_post_ocr` or `inline_ocr`) |
 | **Simulator** | `sim_close` | Close Playwright session and stop loopback server |
 | **Math & Data** | `data_ingest` | Ingest inline rows or confined CSV/JSON preserving `ProvenanceSource` |
 | **Math & Data** | `data_analyze` | Safe AST column transforms, free/zero-intercept OLS, % deviations |
 | **Math & Data** | `calc_eval` | Safe 5-dim SI dimensional calculator (AC complex, 3D vectors, uncertainties) |
+| **Math & Data** | `compute_sim` | Sandboxed zero-eval ODE IVP (`RK45`/`Radau`/`BDF`), algebraic grid, & FFT (`model_computed`) |
 | **Visuals** | `plot_render` | Headless Matplotlib vector `.svg` + 300 DPI `.png` plots (Noto Sans EN/RU) |
 | **Visuals** | `diagram_render` | `schemdraw` circuit schematics + parametric phasor/waveform/field SVGs |
 | **Reports** | `report_build` | Offline HTML+KaTeX → A4 PDF, editable `.docx`, `evidence.zip`, Teacher PDF |
@@ -146,3 +149,5 @@ Features:
 - [`PHASE_0_PLAN.md`](./PHASE_0_PLAN.md) — Day-0 non-destructive Ruffle `0.7.1` & RapidOCR ONNX verification findings.
 - [`PHASE_1_PLAN.md`](./PHASE_1_PLAN.md) — Clean-slate migration, Python `3.13` environment, offline asset pinning, and frozen core contracts.
 - [`PHASE_2_PLAN.md`](./PHASE_2_PLAN.md) — Core subsystems blueprint and verification findings (`2A`–`2D`).
+- [`PHASE_3_PLAN.md`](./PHASE_3_PLAN.md) — Automated verification, live dual-lab E2E benchmarks, visual QA, and `.mcpb` / viewer checks.
+- [`MILESTONE_2_PLAN.md`](./MILESTONE_2_PLAN.md) — Milestone 2 (`sim_watch` timed transients, `compute_sim` sandboxed ODE/FFT engine, `pea-viewer` Datasets view, and `v0.3.0` packaging).

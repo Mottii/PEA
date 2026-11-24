@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pea-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "Physics Experiments Automation (PEA v2) — zero-API-cost deterministic MCP server, universal simulator engine, physics math, and academic report compiler."
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
