@@ -2056,8 +2056,10 @@ class SimulatorSession:
                     else:
                         next_slot = 1
 
+                    t_before = time.perf_counter()
                     png_bytes = await self.page.screenshot(type="png")
-                    frame_elapsed_s = max(0.0, time.perf_counter() - t0)
+                    t_after = time.perf_counter()
+                    frame_elapsed_s = max(0.0, 0.5 * (t_before + t_after) - t0)
                     frame_captured_at = datetime.now(UTC)
 
                     if pacing_mode == "burst_post_ocr":

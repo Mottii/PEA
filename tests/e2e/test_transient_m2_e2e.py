@@ -137,9 +137,9 @@ def _build_html5_rc_profile(sim_sha256: str) -> dict[str, Any]:
         "readouts": {
             "t": {
                 "name": "t",
-                "roi_px": [65, 252, 280, 296],
+                "roi_px": [48, 238, 292, 310],
                 "ocr_mode": "rec_only",
-                "pad_px": 0,
+                "pad_px": 8,
                 "scale": 1.0,
                 "parse_mode": "float",
                 "unit_pattern": "s",
@@ -147,9 +147,9 @@ def _build_html5_rc_profile(sim_sha256: str) -> dict[str, Any]:
             },
             "Vc": {
                 "name": "Vc",
-                "roi_px": [365, 252, 580, 296],
+                "roi_px": [348, 238, 592, 310],
                 "ocr_mode": "rec_only",
-                "pad_px": 0,
+                "pad_px": 8,
                 "scale": 1.0,
                 "parse_mode": "float",
                 "unit_pattern": "V",
@@ -343,11 +343,17 @@ async def test_m2_html5_transient_watch_ode_fft_live_e2e(tmp_path: Path) -> None
                     },
                 )
             )
+            rc_watch_rows = json.loads(
+                (run_root / "datasets" / "rc_watch.json").read_text(encoding="utf-8")
+            )["rows"]
             reg = rc_analysis["regressions"][0]
             slope = float(reg["slope"])
             r_squared = float(reg["r_squared"])
-            assert slope < 0.0
-            assert r_squared > 0.99
+            rc_diag = [(r.get("elapsed_s"), r.get("t"), r.get("Vc")) for r in rc_watch_rows]
+            assert slope < 0.0, f"Expected negative OLS slope, got {slope} with rows={rc_diag}"
+            assert r_squared > 0.99, (
+                f"Expected R^2 > 0.99, got {r_squared:.6f} (slope={slope:.6f}) with rows={rc_diag}"
+            )
 
             calc_tau_meas = _parse_tool_json(
                 await session.call_tool(
@@ -405,9 +411,6 @@ async def test_m2_html5_transient_watch_ode_fft_live_e2e(tmp_path: Path) -> None
             assert rc_ode["dataset_relpath"] == "datasets/rc_ode.json"
             assert rc_ode["row_count"] == 100
 
-            rc_watch_rows = json.loads(
-                (run_root / "datasets" / "rc_watch.json").read_text(encoding="utf-8")
-            )["rows"]
             rc_ode_rows = json.loads(
                 (run_root / "datasets" / "rc_ode.json").read_text(encoding="utf-8")
             )["rows"]
