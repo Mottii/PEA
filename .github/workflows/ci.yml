@@ -95,8 +95,6 @@ jobs:
   offline-tests:
     name: Offline Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
-    env:
-      PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
     strategy:
       fail-fast: false
       matrix:
@@ -129,11 +127,12 @@ jobs:
           .venv/bin/python scripts/fetch_assets.py --fetch
           .venv/bin/python scripts/fetch_assets.py --check
 
-      - name: Resolve Playwright version for cache key
+      - name: Resolve Playwright version and browser cache path
         id: pw
         run: |
           PW_VER=$(.venv/bin/python -c "import importlib.metadata as m; print(m.version('playwright'))")
           echo "version=${PW_VER}" >> "$GITHUB_OUTPUT"
+          echo "PLAYWRIGHT_BROWSERS_PATH=${RUNNER_TEMP}/ms-playwright" >> "$GITHUB_ENV"
 
       - name: Cache Playwright Chromium
         id: pw-cache
@@ -156,8 +155,6 @@ jobs:
   live-html5-e2e:
     name: Live HTML5 RC/RLC E2E (ubuntu-latest, Python 3.13)
     runs-on: ubuntu-latest
-    env:
-      PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -185,11 +182,12 @@ jobs:
           .venv/bin/python scripts/fetch_assets.py --fetch
           .venv/bin/python scripts/fetch_assets.py --check
 
-      - name: Resolve Playwright version for cache key
+      - name: Resolve Playwright version and browser cache path
         id: pw
         run: |
           PW_VER=$(.venv/bin/python -c "import importlib.metadata as m; print(m.version('playwright'))")
           echo "version=${PW_VER}" >> "$GITHUB_OUTPUT"
+          echo "PLAYWRIGHT_BROWSERS_PATH=${RUNNER_TEMP}/ms-playwright" >> "$GITHUB_ENV"
 
       - name: Cache Playwright Chromium
         id: pw-cache
