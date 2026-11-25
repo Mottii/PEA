@@ -15,16 +15,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up uv and Python 3.13
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
 
       - name: Create venv and install dev dependencies
         run: |
-          uv venv .venv --python 3.13
+          uv venv --clear .venv --python 3.13
           uv pip install --python .venv/bin/python -e ".[dev]"
 
       - name: Verify tag matches pyproject.toml and package version
@@ -90,7 +92,7 @@ jobs:
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: |

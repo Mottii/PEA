@@ -19,16 +19,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up uv and Python 3.13
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
 
       - name: Create venv and install dev dependencies
         run: |
-          uv venv .venv --python 3.13
+          uv venv --clear .venv --python 3.13
           uv pip install --python .venv/bin/python -e ".[dev]"
 
       - name: Run ruff linter
@@ -102,20 +104,22 @@ jobs:
         python-version: ["3.12", "3.13"]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up uv and Python ${{ matrix.python-version }}
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
 
       - name: Create venv and install dev dependencies
         run: |
-          uv venv .venv --python ${{ matrix.python-version }}
+          uv venv --clear .venv --python ${{ matrix.python-version }}
           uv pip install --python .venv/bin/python -e ".[dev]"
 
       - name: Cache pinned offline assets
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: local_assets
           key: local-assets-${{ hashFiles('scripts/fetch_assets.py') }}
@@ -133,7 +137,7 @@ jobs:
 
       - name: Cache Playwright Chromium
         id: pw-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
           key: playwright-chromium-${{ runner.os }}-${{ runner.arch }}-${{ steps.pw.outputs.version }}
@@ -156,20 +160,22 @@ jobs:
       PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up uv and Python 3.13
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
 
       - name: Create venv and install dev dependencies
         run: |
-          uv venv .venv --python 3.13
+          uv venv --clear .venv --python 3.13
           uv pip install --python .venv/bin/python -e ".[dev]"
 
       - name: Cache pinned offline assets
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: local_assets
           key: local-assets-${{ hashFiles('scripts/fetch_assets.py') }}
@@ -187,7 +193,7 @@ jobs:
 
       - name: Cache Playwright Chromium
         id: pw-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
           key: playwright-chromium-${{ runner.os }}-${{ runner.arch }}-${{ steps.pw.outputs.version }}
