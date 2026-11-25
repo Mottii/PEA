@@ -1,0 +1,71 @@
+{
+  "name": "Protect main branch",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [
+    {
+      "actor_id": 5,
+      "actor_type": "RepositoryRole",
+      "bypass_mode": "always"
+    }
+  ],
+  "conditions": {
+    "ref_name": {
+      "include": [
+        "~DEFAULT_BRANCH"
+      ],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "deletion"
+    },
+    {
+      "type": "non_fast_forward"
+    },
+    {
+      "type": "pull_request",
+      "parameters": {
+        "required_approving_review_count": 1,
+        "dismiss_stale_reviews_on_push": true,
+        "require_code_owner_review": false,
+        "required_review_thread_resolution": true,
+        "require_last_push_approval": false
+      }
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": true,
+        "do_not_enforce_on_create": false,
+        "required_status_checks": [
+          {
+            "context": "Lint, MCPB Audit & Hygiene",
+            "integration_id": 15368
+          },
+          {
+            "context": "Offline Tests (ubuntu-latest, Python 3.12)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Offline Tests (ubuntu-latest, Python 3.13)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Offline Tests (macos-latest, Python 3.12)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Offline Tests (macos-latest, Python 3.13)",
+            "integration_id": 15368
+          },
+          {
+            "context": "Live HTML5 RC/RLC E2E (ubuntu-latest, Python 3.13)",
+            "integration_id": 15368
+          }
+        ]
+      }
+    }
+  ]
+}
