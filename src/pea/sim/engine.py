@@ -11,6 +11,7 @@ import math
 import os
 import re
 import secrets
+import shutil
 import sys
 import time
 from collections import deque
@@ -2354,11 +2355,12 @@ class SimulatorManager:
         if provided != 1:
             raise ValueError("Provide exactly one of swf_path, html5_dir, or url")
 
-        workspace = (
-            self.workspace_manager.get_run(run_id)
-            if run_id is not None
-            else self.workspace_manager.create_run(source="simulator_captured")
-        )
+        created_workspace: RunWorkspace | None = None
+        if run_id is not None:
+            workspace = self.workspace_manager.get_run(run_id)
+        else:
+            workspace = self.workspace_manager.create_run(source="simulator_captured")
+            created_workspace = workspace
 
         server: SimRuntimeServer | None = None
         swf_meta: SwfMeta | None = None
@@ -2367,54 +2369,54 @@ class SimulatorManager:
         stage_w = viewport_width or 900
         stage_h = viewport_height or 700
         eff_header_h = header_height_px
-
-        if swf_path is not None:
-            server = SimRuntimeServer(
-                host=self.config.loopback_host,
-                port=0,
-                header_height_px=header_height_px,
-            )
-            swf_meta = server.configure_swf(swf_path, self.config.local_assets_dir / "ruffle")
-            sim_sha256 = swf_meta.sha256
-            loopback_origin = server.start()
-            target_url = f"{loopback_origin}/index.html"
-            stage_w = swf_meta.stage_width
-            stage_h = swf_meta.stage_height
-            vp_w = viewport_width or max(900, stage_w + 40)
-            vp_h = viewport_height or max(700, stage_h + eff_header_h + 40)
-        elif html5_dir is not None:
-            eff_header_h = 0
-            server = SimRuntimeServer(
-                host=self.config.loopback_host,
-                port=0,
-                header_height_px=0,
-            )
-            server.configure_html5_dir(html5_dir, entry_file=entry_file)
-            sim_sha256 = compute_html5_dir_sha256(html5_dir)
-            loopback_origin = server.start()
-            target_url = f"{loopback_origin}/"
-            vp_w = viewport_width or 1024
-            vp_h = viewport_height or 768
-            stage_w, stage_h = vp_w, vp_h
-        else:
-            assert url is not None
-            eff_header_h = 0
-            loopback_origin = None
-            if not _origin_matches_allowlist(url, self.config):
-                parsed = urlsplit(url)
-                raise PermissionError(
-                    f"URL origin {parsed.scheme}://{parsed.netloc} is not allowlisted. "
-                    "Add it explicitly via PEA_ALLOWED_ORIGINS."
-                )
-            sim_sha256 = compute_url_sha256(url)
-            target_url = url
-            vp_w = viewport_width or 1024
-            vp_h = viewport_height or 768
-            stage_w, stage_h = vp_w, vp_h
-
         context = None
         page = None
+
         try:
+            if swf_path is not None:
+                server = SimRuntimeServer(
+                    host=self.config.loopback_host,
+                    port=0,
+                    header_height_px=header_height_px,
+                )
+                swf_meta = server.configure_swf(swf_path, self.config.local_assets_dir / "ruffle")
+                sim_sha256 = swf_meta.sha256
+                loopback_origin = server.start()
+                target_url = f"{loopback_origin}/index.html"
+                stage_w = swf_meta.stage_width
+                stage_h = swf_meta.stage_height
+                vp_w = viewport_width or max(900, stage_w + 40)
+                vp_h = viewport_height or max(700, stage_h + eff_header_h + 40)
+            elif html5_dir is not None:
+                eff_header_h = 0
+                server = SimRuntimeServer(
+                    host=self.config.loopback_host,
+                    port=0,
+                    header_height_px=0,
+                )
+                server.configure_html5_dir(html5_dir, entry_file=entry_file)
+                sim_sha256 = compute_html5_dir_sha256(html5_dir)
+                loopback_origin = server.start()
+                target_url = f"{loopback_origin}/"
+                vp_w = viewport_width or 1024
+                vp_h = viewport_height or 768
+                stage_w, stage_h = vp_w, vp_h
+            else:
+                assert url is not None
+                eff_header_h = 0
+                loopback_origin = None
+                if not _origin_matches_allowlist(url, self.config):
+                    parsed = urlsplit(url)
+                    raise PermissionError(
+                        f"URL origin {parsed.scheme}://{parsed.netloc} is not allowlisted. "
+                        "Add it explicitly via PEA_ALLOWED_ORIGINS."
+                    )
+                sim_sha256 = compute_url_sha256(url)
+                target_url = url
+                vp_w = viewport_width or 1024
+                vp_h = viewport_height or 768
+                stage_w, stage_h = vp_w, vp_h
+
             browser = await self._ensure_browser()
             context = await browser.new_context(
                 viewport={"width": vp_w, "height": vp_h},
@@ -2506,19 +2508,28 @@ class SimulatorManager:
             self._sessions[session_id] = session
             return session
 
-        except Exception:
+        except BaseException:
             if page is not None:
                 try:
                     await page.close()
-                except Exception:
+                except BaseException:
                     pass
             if context is not None:
                 try:
                     await context.close()
-                except Exception:
+                except BaseException:
                     pass
             if server is not None:
-                server.stop()
+                try:
+                    server.stop()
+                except Exception:
+                    pass
+            if created_workspace is not None:
+                try:
+                    if not created_workspace.read_provenance():
+                        shutil.rmtree(created_workspace.root, ignore_errors=True)
+                except Exception:
+                    pass
             raise
 
     async def close_session(self, session_id: str) -> None:

@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build, Audit & Publish .mcpb Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv and Python 3.13
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Create venv and install dev dependencies
+        run: |
+          uv venv .venv --python 3.13
+          uv pip install --python .venv/bin/python -e ".[dev]"
+
+      - name: Verify tag matches pyproject.toml and package version
+        id: version
+        run: |
+          .venv/bin/python - <<'PY'
+          import os, sys, tomllib
+          from pathlib import Path
+          import pea
+
+          data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          version = data["project"]["version"].strip()
+          if pea.__version__ != version:
+              print(
+                  f"Package version mismatch: pea.__version__={pea.__version__!r} != "
+                  f"pyproject.toml={version!r}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          ref = os.environ.get("GITHUB_REF", "")
+          ref_name = os.environ.get("GITHUB_REF_NAME", "")
+          if ref.startswith("refs/tags/"):
+              expected_tag = f"v{version}"
+              if ref_name != expected_tag:
+                  print(
+                      f"Tag mismatch: tag {ref_name!r} != expected {expected_tag!r} "
+                      f"(from pyproject.toml)",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"version={version}\n")
+          print(f"Verified project version: {version}")
+          PY
+
+      - name: Run ruff linter
+        run: .venv/bin/ruff check src/ tests/ scripts/
+
+      - name: Check and build audited .mcpb bundle
+        run: |
+          .venv/bin/python scripts/build_mcpb.py --check
+          node --check packaging/mcpb/launcher.mjs
+          .venv/bin/python scripts/build_mcpb.py
+
+      - name: Generate SHA256SUMS.txt
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          .venv/bin/python - <<'PY'
+          import hashlib, os
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          dist_dir = Path("dist")
+          bundle = dist_dir / f"pea-mcp-{version}.mcpb"
+          if not bundle.is_file():
+              raise SystemExit(f"Expected bundle missing: {bundle}")
+          digest = hashlib.sha256(bundle.read_bytes()).hexdigest()
+          sums_path = dist_dir / "SHA256SUMS.txt"
+          sums_path.write_text(f"{digest}  {bundle.name}\n", encoding="utf-8")
+          print(sums_path.read_text(encoding="utf-8").strip())
+          PY
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/pea-mcp-${{ steps.version.outputs.version }}.mcpb
+            dist/SHA256SUMS.txt

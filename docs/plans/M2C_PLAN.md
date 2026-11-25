@@ -2,7 +2,7 @@
 
 > **Status:** `Complete (2026-11-24)`
 > **Parent Plan:** [`MILESTONE_2_PLAN.md`](./MILESTONE_2_PLAN.md)
-> **Prerequisite:** M2A & M2B complete (frozen `ComputeSimSpec` / `ComputeSimResult` contracts in [`src/pea/schemas.py`](./src/pea/schemas.py); `sim_watch` & HTML5 fingerprinting in [`src/pea/sim/engine.py`](./src/pea/sim/engine.py); `ruff` clean; `scripts/build_mcpb.py --check` clean).
+> **Prerequisite:** M2A & M2B complete (frozen `ComputeSimSpec` / `ComputeSimResult` contracts in [`src/pea/schemas.py`](../../src/pea/schemas.py); `sim_watch` & HTML5 fingerprinting in [`src/pea/sim/engine.py`](../../src/pea/sim/engine.py); `ruff` clean; `scripts/build_mcpb.py --check` clean).
 
 ---
 
@@ -16,15 +16,15 @@
    * Persist results atomically as immutable `model_computed` datasets via `data_ingest(...)` and return compact `ComputeSimResult` payloads (`preview_rows` bounded to at most 10 rows).
 2. **Package & Protocol Wiring (`[MODIFY] src/pea/math_engine/__init__.py`, `src/pea/sim/protocols_m2.py`):**
    * Export `run_compute_sim`, `ComputeSimError`, `ComputeSimTimeoutError`, and `ComputeSimLimitError` from `pea.math_engine`.
-   * Replace the stub `compute_sim(spec, run_workspace)` in [`src/pea/sim/protocols_m2.py`](./src/pea/sim/protocols_m2.py) to validate `ComputeSimSpec` and delegate to `run_compute_sim(validated, run_workspace=run_workspace)`.
+   * Replace the stub `compute_sim(spec, run_workspace)` in [`src/pea/sim/protocols_m2.py`](../../src/pea/sim/protocols_m2.py) to validate `ComputeSimSpec` and delegate to `run_compute_sim(validated, run_workspace=run_workspace)`.
 3. **Offline Unit & Protocol Test Suite (`[NEW] tests/test_compute_sim.py`, `[MODIFY] tests/test_sim_protocols.py`):**
-   * Create comprehensive unit tests in [`tests/test_compute_sim.py`](./tests/test_compute_sim.py) covering analytical 1D/2D ODEs, stiff solvers, algebraic grids, inline & dataset-backed FFTs, provenance immutability, and AST sandbox / resource-cap rejections.
-   * Update `test_protocols_m2_sim_watch_delegation_and_compute_sim_stub` in [`tests/test_sim_protocols.py`](./tests/test_sim_protocols.py) to verify real `compute_sim(spec, run_workspace)` delegation.
+   * Create comprehensive unit tests in [`tests/test_compute_sim.py`](../../tests/test_compute_sim.py) covering analytical 1D/2D ODEs, stiff solvers, algebraic grids, inline & dataset-backed FFTs, provenance immutability, and AST sandbox / resource-cap rejections.
+   * Update `test_protocols_m2_sim_watch_delegation_and_compute_sim_stub` in [`tests/test_sim_protocols.py`](../../tests/test_sim_protocols.py) to verify real `compute_sim(spec, run_workspace)` delegation.
 
 ### Out of Scope for M2C *(Deferred to M2D)*
-* Registering MCP tools `#17–#18` (`sim_watch`, `compute_sim`) in [`src/pea/mcp_server.py`](./src/pea/mcp_server.py) and `packaging/mcpb/manifest.json`.
+* Registering MCP tools `#17–#18` (`sim_watch`, `compute_sim`) in [`src/pea/mcp_server.py`](../../src/pea/mcp_server.py) and `packaging/mcpb/manifest.json`.
 * Adding the **Datasets & Model Outputs** UI card in `pea-viewer` (`src/pea/viewer/`).
-* Updating [`skills/pea-lab-assistant/SKILL.md`](./skills/pea-lab-assistant/SKILL.md), [`README.md`](./README.md), and [`PLAN_V2.md`](./PLAN_V2.md), bumping version `0.2.0` → `0.3.0`, and running the live HTML5 RC/RLC E2E benchmark (`tests/e2e/test_transient_m2_e2e.py`).
+* Updating [`skills/pea-lab-assistant/SKILL.md`](../../skills/pea-lab-assistant/SKILL.md), [`README.md`](../../README.md), and [`PLAN_V2.md`](./PLAN_V2.md), bumping version `0.2.0` → `0.3.0`, and running the live HTML5 RC/RLC E2E benchmark (`tests/e2e/test_transient_m2_e2e.py`).
 
 ---
 

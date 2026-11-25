@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import http.client
 import io
 import json
 import math
+import struct
 import time
+import zlib
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -56,9 +59,35 @@ from pea.sim.engine import _is_route_url_allowed
 from pea.workspace import WorkspaceManager
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SIMS_DIR = REPO_ROOT / "local_assets" / "sims"
 RUFFLE_DIR = REPO_ROOT / "local_assets" / "ruffle"
 SAMPLE_SHA256 = "35e4a257134073356c9796965ea3ea2d9362d51b2dc87486dc93e85a0fb96b15"
+
+
+def _write_synthetic_cws_swf(
+    tmp_path: Path,
+    *,
+    filename: str = "sample.swf",
+    width: int = 800,
+    height: int = 600,
+    fps: float = 24.0,
+) -> tuple[Path, str]:
+    """Create a valid CWS SWF header in ``tmp_path`` and return ``(path, sha256)``."""
+    vals = (0, width * 20, 0, height * 20)
+    nbits = 1
+    for v in vals:
+        while not (-(1 << (nbits - 1)) <= v <= (1 << (nbits - 1)) - 1):
+            nbits += 1
+    bits = f"{nbits:05b}"
+    mask = (1 << nbits) - 1
+    for v in vals:
+        bits += f"{v & mask:0{nbits}b}"
+    bits += "0" * ((-len(bits)) % 8)
+    rect = bytes(int(bits[i : i + 8], 2) for i in range(0, len(bits), 8))
+    body = rect + struct.pack("<HH", int(round(fps * 256)), 1) + b"\x00\x00"
+    raw = b"CWS" + bytes([9]) + struct.pack("<I", 8 + len(body)) + zlib.compress(body)
+    swf_path = tmp_path / filename
+    swf_path.write_bytes(raw)
+    return swf_path, hashlib.sha256(raw).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -66,10 +95,12 @@ SAMPLE_SHA256 = "35e4a257134073356c9796965ea3ea2d9362d51b2dc87486dc93e85a0fb96b1
 # ---------------------------------------------------------------------------
 
 
-def test_runtime_server_swf_mode_security_and_auto_sized_html() -> None:
-    swf_path = SIMS_DIR / "m96220.swf"
+def test_runtime_server_swf_mode_security_and_auto_sized_html(tmp_path: Path) -> None:
+    swf_path, swf_sha = _write_synthetic_cws_swf(
+        tmp_path, filename="synthetic_rlc.swf", width=800, height=600
+    )
     server = SimRuntimeServer(host="127.0.0.1", port=0, header_height_px=39)
-    meta = server.configure_swf(swf_path, RUFFLE_DIR, expected_sha256=SAMPLE_SHA256)
+    meta = server.configure_swf(swf_path, RUFFLE_DIR, expected_sha256=swf_sha)
     assert (meta.stage_width, meta.stage_height) == (800, 600)
 
     with server:
@@ -88,19 +119,19 @@ def test_runtime_server_swf_mode_security_and_auto_sized_html() -> None:
         assert "height: 39px;" in r_idx.text
         assert "allowScriptAccess: false" in r_idx.text
         assert 'allowNetworking: "none"' in r_idx.text
-        assert "/sim/m96220.swf" in r_idx.text
+        assert "/sim/synthetic_rlc.swf" in r_idx.text
 
         # Ruffle asset & verified SWF served with correct MIME
         r_js = httpx.get(f"{origin}/ruffle/ruffle.js")
         assert r_js.status_code == 200
         assert "javascript" in r_js.headers["content-type"]
 
-        r_swf = httpx.get(f"{origin}/sim/m96220.swf")
+        r_swf = httpx.get(f"{origin}/sim/synthetic_rlc.swf")
         assert r_swf.status_code == 200
         assert len(r_swf.content) == swf_path.stat().st_size
 
         # Unknown SWF under /sim/ rejected
-        assert httpx.get(f"{origin}/sim/m96210.swf").status_code == 404
+        assert httpx.get(f"{origin}/sim/other_sim.swf").status_code == 404
 
         # Path traversal under /ruffle/ rejected (raw connection preserves ..)
         host_hdr = {"Host": f"127.0.0.1:{parsed.port}"}
@@ -166,8 +197,10 @@ def test_runtime_server_html5_dir_mode_confinement(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("ipv6_host", ["::1", "[::1]"])
-def test_runtime_server_ipv6_loopback_and_host_guard(ipv6_host: str) -> None:
-    swf_path = SIMS_DIR / "m96220.swf"
+def test_runtime_server_ipv6_loopback_and_host_guard(tmp_path: Path, ipv6_host: str) -> None:
+    swf_path, _ = _write_synthetic_cws_swf(
+        tmp_path, filename="synthetic_ipv6.swf", width=800, height=600
+    )
     server = SimRuntimeServer(host=ipv6_host, port=0, header_height_px=39)
     server.configure_swf(swf_path, RUFFLE_DIR)
     with server:
@@ -177,7 +210,7 @@ def test_runtime_server_ipv6_loopback_and_host_guard(ipv6_host: str) -> None:
 
         r = httpx.get(f"{origin}/index.html")
         assert r.status_code == 200
-        assert "/sim/m96220.swf" in r.text
+        assert "/sim/synthetic_ipv6.swf" in r.text
 
         conn = http.client.HTTPConnection("::1", port, timeout=3)
         conn.putrequest("GET", "/index.html", skip_host=True)
@@ -2602,3 +2635,131 @@ async def test_sim_watch_ocr_failure_during_flush_and_html5_open_stage_handling(
         assert sess_diff.profile is None
     finally:
         await mgr.close_session(sess_diff.session_id)
+
+
+async def test_simulator_manager_open_cleans_up_orphan_workspace_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed SimulatorManager.open(run_id=None) must remove newly created empty run dirs."""
+    html5_dir = tmp_path / "html5_sim"
+    html5_dir.mkdir()
+    (html5_dir / "index.html").write_text("<h1>OK</h1>", encoding="utf-8")
+
+    runs_dir = tmp_path / "runs"
+    cfg = PeaConfig(
+        project_root=REPO_ROOT,
+        local_assets_dir=REPO_ROOT / "local_assets",
+        runs_dir=runs_dir,
+        profiles_dir=tmp_path / "profiles",
+    )
+    mgr = SimulatorManager(
+        cfg,
+        ocr=_TransientMockOcrBackend({}),  # type: ignore[arg-type]
+    )
+
+    # 1. Missing entry_file under html5_dir -> raises and cleans up orphan run dir
+    with pytest.raises(FileNotFoundError):
+        await mgr.open(html5_dir=html5_dir, entry_file="missing.html", settle_ms=0)
+    assert list(runs_dir.iterdir()) == []
+
+    # 2. Non-allowlisted URL -> raises PermissionError and cleans up orphan run dir
+    with pytest.raises(PermissionError, match="not allowlisted"):
+        await mgr.open(url="https://unlisted.example.com/sim", settle_ms=0)
+    assert list(runs_dir.iterdir()) == []
+
+    # 3. Missing SWF file -> raises FileNotFoundError and cleans up orphan run dir
+    with pytest.raises(FileNotFoundError):
+        await mgr.open(swf_path=tmp_path / "missing.swf", settle_ms=0)
+    assert list(runs_dir.iterdir()) == []
+
+    # 4. Browser launch failure after server start -> stops server and cleans up orphan run dir
+    stop_calls: list[bool] = []
+    monkeypatch.setattr(SimRuntimeServer, "start", lambda self: "http://127.0.0.1:59992")
+    monkeypatch.setattr(SimRuntimeServer, "stop", lambda self: stop_calls.append(True))
+
+    async def _failing_browser() -> Any:
+        raise RuntimeError("Chromium launch failed")
+
+    mgr._ensure_browser = _failing_browser  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="Chromium launch failed"):
+        await mgr.open(html5_dir=html5_dir, settle_ms=0)
+    assert stop_calls == [True]
+    assert list(runs_dir.iterdir()) == []
+
+    # 5. Post-new_page() failure (page.goto raises) & even if server.stop raises ->
+    #    closes page & context, stops server, removes orphan run dir, preserves original error
+    events: list[str] = []
+
+    class _FailingPage:
+        def __init__(self, exc: BaseException) -> None:
+            self._exc = exc
+
+        async def route(self, _pattern: str, _handler: Any) -> None:
+            pass
+
+        def on(self, _event: str, _cb: Any) -> None:
+            pass
+
+        async def goto(self, _url: str, *, wait_until: str = "domcontentloaded") -> None:
+            raise self._exc
+
+        async def close(self) -> None:
+            events.append("page.close")
+
+    class _FailingContext:
+        def __init__(self, exc: BaseException) -> None:
+            self._exc = exc
+
+        async def new_page(self) -> _FailingPage:
+            return _FailingPage(self._exc)
+
+        async def close(self) -> None:
+            events.append("context.close")
+
+    class _FailingBrowser:
+        def __init__(self, exc: BaseException) -> None:
+            self._exc = exc
+
+        async def new_context(self, **_kwargs: Any) -> _FailingContext:
+            return _FailingContext(self._exc)
+
+    def _raising_stop(self: SimRuntimeServer) -> None:
+        events.append("server.stop")
+        raise RuntimeError("socket close glitch")
+
+    monkeypatch.setattr(SimRuntimeServer, "stop", _raising_stop)
+
+    async def _goto_error_browser() -> Any:
+        return _FailingBrowser(RuntimeError("net::ERR_CONNECTION_REFUSED"))
+
+    mgr._ensure_browser = _goto_error_browser  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="net::ERR_CONNECTION_REFUSED"):
+        await mgr.open(html5_dir=html5_dir, settle_ms=0)
+    assert events == ["page.close", "context.close", "server.stop"]
+    assert list(runs_dir.iterdir()) == []
+
+    # 6. asyncio.CancelledError (BaseException) mid-open must also clean up page, context,
+    #    server, and orphan run dir before re-raising CancelledError
+    events.clear()
+    monkeypatch.setattr(SimRuntimeServer, "stop", lambda self: events.append("server.stop"))
+
+    async def _cancelled_browser() -> Any:
+        return _FailingBrowser(asyncio.CancelledError())
+
+    mgr._ensure_browser = _cancelled_browser  # type: ignore[method-assign]
+    with pytest.raises(asyncio.CancelledError):
+        await mgr.open(html5_dir=html5_dir, settle_ms=0)
+    assert events == ["page.close", "context.close", "server.stop"]
+    assert list(runs_dir.iterdir()) == []
+
+    # 7. Explicitly provided existing run_id must NEVER be deleted on failure
+    existing = mgr.workspace_manager.create_run(label="Existing Run", source="simulator_captured")
+    with pytest.raises(FileNotFoundError):
+        await mgr.open(
+            html5_dir=html5_dir,
+            entry_file="missing.html",
+            run_id=existing.run_id,
+            settle_ms=0,
+        )
+    assert existing.root.is_dir()

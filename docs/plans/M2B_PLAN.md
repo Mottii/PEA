@@ -2,7 +2,7 @@
 
 > **Status:** `Complete (2026-11-24)`
 > **Parent Plan:** [`MILESTONE_2_PLAN.md`](./MILESTONE_2_PLAN.md)
-> **Prerequisite:** M2A complete (frozen `WatchSpec`, `WatchResult`, `ComputeSimSpec`, `ComputeSimResult`, and `MeasurementPoint` timing contracts in [`src/pea/schemas.py`](./src/pea/schemas.py); `ruff` clean; `scripts/build_mcpb.py --check` clean).
+> **Prerequisite:** M2A complete (frozen `WatchSpec`, `WatchResult`, `ComputeSimSpec`, `ComputeSimResult`, and `MeasurementPoint` timing contracts in [`src/pea/schemas.py`](../../src/pea/schemas.py); `ruff` clean; `scripts/build_mcpb.py --check` clean).
 
 ---
 

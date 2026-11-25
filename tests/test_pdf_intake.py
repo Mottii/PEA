@@ -22,6 +22,101 @@ def _make_workspace(tmp_path: Path):
     return wm.create_run(label="pdf-intake-test")
 
 
+def _write_synthetic_two_page_pdf(dest: Path) -> Path:
+    """Create a minimal 2-page PDF with real renderable visuals and extractable text."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    with PdfPages(dest) as pdf:
+        fig1, ax1 = plt.subplots(figsize=(6, 4))
+        ax1.axis("off")
+        ax1.text(0.1, 0.7, "PEA Synthetic Physics Handout", fontsize=16)
+        ax1.text(0.1, 0.45, "Page 1: RC Discharge Table 1", fontsize=12)
+        pdf.savefig(fig1)
+        plt.close(fig1)
+
+        fig2, ax2 = plt.subplots(figsize=(6, 4))
+        ax2.axis("off")
+        ax2.text(0.1, 0.7, "Page 2: Damped RLC Oscillations", fontsize=16)
+        ax2.text(0.1, 0.45, "Reference frequency f0 = 2.00 Hz", fontsize=12)
+        pdf.savefig(fig2)
+        plt.close(fig2)
+    return dest
+
+
+def test_inspect_pdf_synthetic_document(tmp_path: Path) -> None:
+    """Always-run synthetic 2-page PDF test verifying render, text, provenance, and immutability."""
+    pdf_path = _write_synthetic_two_page_pdf(tmp_path / "synthetic-handout.pdf")
+    ws = _make_workspace(tmp_path)
+
+    result = inspect_pdf(pdf_path, ws, dpi=100, max_pages=10)
+    assert result.run_id == ws.run_id
+    assert result.source_filename == "synthetic-handout.pdf"
+    assert result.total_pages == 2
+    assert result.rendered_pages == 2
+    assert result.truncated is False
+    assert result.dpi == 100
+    assert len(result.pages) == 2
+
+    for idx, page in enumerate(result.pages, start=1):
+        assert page.page_number == idx
+        assert page.image_relpath == f"pdf_pages/page-{idx:03d}.png"
+        assert page.width_px > 200
+        assert page.height_px > 200
+        img_path = ws.resolve_path(page.image_relpath)
+        assert img_path.is_file()
+        with Image.open(img_path) as im:
+            assert im.size == (page.width_px, page.height_px)
+            im.verify()
+
+    assert "Synthetic Physics Handout" in result.full_text
+    assert "Table 1" in result.pages[0].text
+    assert "RLC Oscillations" in result.pages[1].text
+
+    text_json_path = ws.resolve_path(result.extracted_text_relpath)
+    assert text_json_path.is_file()
+    raw_json = text_json_path.read_text(encoding="utf-8")
+    assert str(Path.home()) not in raw_json
+    parsed = json.loads(raw_json)
+    assert parsed["total_pages"] == 2
+    assert len(parsed["pages"]) == 2
+
+    # Provenance verification covers both rendered pages + extracted-text.json
+    entries = ws.read_provenance()
+    kinds = [e.kind for e in entries]
+    assert kinds.count("pdf_handout_page") == 2
+    assert kinds.count("pdf_handout_text") == 1
+    assert ws.verify_provenance().ok is True
+
+    # Provenance immutability protects existing pages regardless of overwrite flag
+    with pytest.raises(FileExistsError):
+        inspect_pdf(pdf_path, ws, dpi=100, max_pages=1, overwrite=False)
+    with pytest.raises(FileExistsError):
+        inspect_pdf(pdf_path, ws, dpi=100, max_pages=1, overwrite=True)
+
+    # Distinct subdir supports page selection, deduplication, and truncation checks
+    capped = inspect_pdf(pdf_path, ws, dpi=96, max_pages=1, subdir="capped")
+    assert capped.truncated is True
+    assert [p.page_number for p in capped.pages] == [1]
+
+    selected = inspect_pdf(pdf_path, ws, dpi=96, pages=[2, 1, 2], subdir="selected")
+    assert selected.truncated is False
+    assert [p.page_number for p in selected.pages] == [2, 1]
+    assert selected.pages[0].image_relpath == "pdf_pages/selected/page-002.png"
+    assert ws.verify_provenance().ok is True
+
+    # Invalid page selection and traversal subdir rejected cleanly
+    with pytest.raises(ValueError, match="out of range"):
+        inspect_pdf(pdf_path, ws, pages=[5], subdir="bad_range")
+    with pytest.raises(ValueError, match="empty"):
+        inspect_pdf(pdf_path, ws, pages=[], subdir="bad_empty")
+    with pytest.raises(PathConfinementError):
+        inspect_pdf(pdf_path, ws, max_pages=1, subdir="../escape")
+
+
 @pytest.mark.skipif(not LAB5_HANDOUT.is_file(), reason="Lab 5 benchmark handout PDF not staged")
 def test_inspect_pdf_lab5_handout_all_pages(tmp_path: Path) -> None:
     ws = _make_workspace(tmp_path)

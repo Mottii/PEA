@@ -8,7 +8,7 @@
 
 ## 1. Goal Description
 
-Build all four lab-agnostic core subsystems of **PEA v2** on top of the frozen Phase 1 contracts ([`src/pea/config.py`](./src/pea/config.py), [`src/pea/schemas.py`](./src/pea/schemas.py), [`src/pea/workspace.py`](./src/pea/workspace.py)):
+Build all four lab-agnostic core subsystems of **PEA v2** on top of the frozen Phase 1 contracts ([`src/pea/config.py`](../../src/pea/config.py), [`src/pea/schemas.py`](../../src/pea/schemas.py), [`src/pea/workspace.py`](../../src/pea/workspace.py)):
 
 * **Phase 2A:** Pluggable Offline OCR (`RapidOcrBackend` M1 primary + timeout-guarded macOS Vision) & Universal Playwright/Ruffle Simulator Engine (`sim_open`, `sim_observe`, `sim_act`, `sim_sweep`, `sim_search_extremum`, SHA-256 Calibration Profiles).
 * **Phase 2B:** Safe Dimensional-Analysis Physics Calculator (`calc_eval`), Tabular Transforms & OLS Regression (`data_ingest`, `data_analyze`), Matplotlib Vector Plots (`plot_render`), and `schemdraw` / Parametric Vector Schematics (`diagram_render`).

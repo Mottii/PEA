@@ -2,7 +2,7 @@
 
 > **Status:** `Complete (2026-11-24)`
 > **Parent Plan:** [`MILESTONE_2_PLAN.md`](./MILESTONE_2_PLAN.md)
-> **Prerequisite:** M2A, M2B, and M2C complete (frozen schemas in [`src/pea/schemas.py`](./src/pea/schemas.py); `sim_watch` & HTML5/URL fingerprinting in [`src/pea/sim/engine.py`](./src/pea/sim/engine.py); `compute_sim` sandboxed engine in [`src/pea/math_engine/compute_sim.py`](./src/pea/math_engine/compute_sim.py) + atomic `os.link` `data_ingest`; 191 non-loopback offline tests, `ruff`, and `scripts/build_mcpb.py --check` passing).
+> **Prerequisite:** M2A, M2B, and M2C complete (frozen schemas in [`src/pea/schemas.py`](../../src/pea/schemas.py); `sim_watch` & HTML5/URL fingerprinting in [`src/pea/sim/engine.py`](../../src/pea/sim/engine.py); `compute_sim` sandboxed engine in [`src/pea/math_engine/compute_sim.py`](../../src/pea/math_engine/compute_sim.py) + atomic `os.link` `data_ingest`; 191 non-loopback offline tests, `ruff`, and `scripts/build_mcpb.py --check` passing).
 
 ---
 
@@ -17,27 +17,27 @@
    * Enrich `_detail_run().datasets` defensively with `source`, `row_count`, `columns`, and `notes`.
    * Add a compact **Datasets & Model Outputs** table card (`#datasets-card` / `#datasets-tbody`) between Figures and Provenance Ledger with provenance badges and JSON download links (zero external dependencies, responsive at `1280×800` and `390×844`).
 3. **Version & 18-Tool Parity Bump (`0.2.0` / `16` → `0.3.0` / `18`) & `.mcpb` Build:**
-   * Bump version across [`pyproject.toml`](./pyproject.toml), [`src/pea/__init__.py`](./src/pea/__init__.py), and [`packaging/mcpb/manifest.json`](./packaging/mcpb/manifest.json).
-   * Add `sim_watch` and `compute_sim` to `manifest.json` in canonical order and build/audit `dist/pea-mcp-0.3.0.mcpb` via [`scripts/build_mcpb.py`](./scripts/build_mcpb.py).
+   * Bump version across [`pyproject.toml`](../../pyproject.toml), [`src/pea/__init__.py`](../../src/pea/__init__.py), and [`packaging/mcpb/manifest.json`](../../packaging/mcpb/manifest.json).
+   * Add `sim_watch` and `compute_sim` to `manifest.json` in canonical order and build/audit `dist/pea-mcp-0.3.0.mcpb` via [`scripts/build_mcpb.py`](../../scripts/build_mcpb.py).
 4. **Companion Skill & Documentation Updates:**
-   * Update [`skills/pea-lab-assistant/SKILL.md`](./skills/pea-lab-assistant/SKILL.md), [`README.md`](./README.md), and [`PLAN_V2.md`](./PLAN_V2.md) for the 18-tool surface, Stage 4 `sim_watch`, Stage 5 `compute_sim`, `pea-viewer` Datasets card, and `0.3.0` `.mcpb` bundle.
+   * Update [`skills/pea-lab-assistant/SKILL.md`](../../skills/pea-lab-assistant/SKILL.md), [`README.md`](../../README.md), and [`PLAN_V2.md`](./PLAN_V2.md) for the 18-tool surface, Stage 4 `sim_watch`, Stage 5 `compute_sim`, `pea-viewer` Datasets card, and `0.3.0` `.mcpb` bundle.
 5. **Offline Tests, HTML5 Transient Fixture & Live E2E Benchmark:**
-   * Update [`tests/test_phase1_core.py`](./tests/test_phase1_core.py) and [`tests/test_mcp_protocol.py`](./tests/test_mcp_protocol.py).
-   * Create deterministic local HTML5 RC/RLC fixture [`tests/fixtures/html5_rc_sim/index.html`](./tests/fixtures/html5_rc_sim/index.html) and live E2E benchmark [`tests/e2e/test_transient_m2_e2e.py`](./tests/e2e/test_transient_m2_e2e.py) (`@pytest.mark.live_sim`).
+   * Update [`tests/test_phase1_core.py`](../../tests/test_phase1_core.py) and [`tests/test_mcp_protocol.py`](../../tests/test_mcp_protocol.py).
+   * Create deterministic local HTML5 RC/RLC fixture [`tests/fixtures/html5_rc_sim/index.html`](../../tests/fixtures/html5_rc_sim/index.html) and live E2E benchmark [`tests/e2e/test_transient_m2_e2e.py`](../../tests/e2e/test_transient_m2_e2e.py) (`@pytest.mark.live_sim`).
    * Complete Visual QA on rendered transient PDFs, headless Chromium QA on `pea-viewer`, tracked-file home-path audit, and populate Section 6/7 findings across `M2B_PLAN.md`–`M2D_PLAN.md` and `MILESTONE_2_PLAN.md`.
 
 ### Version & Tool-Count Parity Matrix (`0.2.0 / 16` → `0.3.0 / 18`)
 
 | Touchpoint | Old (`M1`) | New (`M2D`) |
 | :--- | :--- | :--- |
-| [`pyproject.toml`](./pyproject.toml) | `version = "0.2.0"` | `version = "0.3.0"` |
-| [`src/pea/__init__.py`](./src/pea/__init__.py) | `__version__ = "0.2.0"` | `__version__ = "0.3.0"` |
-| [`src/pea/mcp_server.py`](./src/pea/mcp_server.py) | 16 tools (`UNIVERSAL_TOOL_NAMES`, docstrings, `pea://policy`) | 18 tools (adding `sim_watch`, `compute_sim`) |
-| [`packaging/mcpb/manifest.json`](./packaging/mcpb/manifest.json) | `"version": "0.2.0"`, 16 `tools[]`, `"16 universal..."` | `"version": "0.3.0"`, 18 `tools[]`, `"18 universal..."` |
-| [`scripts/build_mcpb.py`](./scripts/build_mcpb.py) | Hardcoded `16 tools` print & docstrings | Dynamic `len(_expected_tool_names())` + `0.3.0` / 18-tool docs |
-| [`skills/pea-lab-assistant/SKILL.md`](./skills/pea-lab-assistant/SKILL.md) | 16-tool reference table | 18-tool table + Stage 4 `sim_watch` & Stage 5 `compute_sim` |
-| [`tests/test_phase1_core.py`](./tests/test_phase1_core.py) | `pea.__version__ == "0.2.0"` | `pea.__version__ == "0.3.0"` |
-| [`tests/test_mcp_protocol.py`](./tests/test_mcp_protocol.py) | `len(tools_res.tools) == 16`, `policy["tools_count"] == 16` | `len(tools_res.tools) == 18`, `policy["tools_count"] == 18` |
+| [`pyproject.toml`](../../pyproject.toml) | `version = "0.2.0"` | `version = "0.3.0"` |
+| [`src/pea/__init__.py`](../../src/pea/__init__.py) | `__version__ = "0.2.0"` | `__version__ = "0.3.0"` |
+| [`src/pea/mcp_server.py`](../../src/pea/mcp_server.py) | 16 tools (`UNIVERSAL_TOOL_NAMES`, docstrings, `pea://policy`) | 18 tools (adding `sim_watch`, `compute_sim`) |
+| [`packaging/mcpb/manifest.json`](../../packaging/mcpb/manifest.json) | `"version": "0.2.0"`, 16 `tools[]`, `"16 universal..."` | `"version": "0.3.0"`, 18 `tools[]`, `"18 universal..."` |
+| [`scripts/build_mcpb.py`](../../scripts/build_mcpb.py) | Hardcoded `16 tools` print & docstrings | Dynamic `len(_expected_tool_names())` + `0.3.0` / 18-tool docs |
+| [`skills/pea-lab-assistant/SKILL.md`](../../skills/pea-lab-assistant/SKILL.md) | 16-tool reference table | 18-tool table + Stage 4 `sim_watch` & Stage 5 `compute_sim` |
+| [`tests/test_phase1_core.py`](../../tests/test_phase1_core.py) | `pea.__version__ == "0.2.0"` | `pea.__version__ == "0.3.0"` |
+| [`tests/test_mcp_protocol.py`](../../tests/test_mcp_protocol.py) | `len(tools_res.tools) == 16`, `policy["tools_count"] == 16` | `len(tools_res.tools) == 18`, `policy["tools_count"] == 18` |
 
 ---
 

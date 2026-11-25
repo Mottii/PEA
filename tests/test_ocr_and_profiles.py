@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from pea.config import PeaConfig
 from pea.ocr import (
@@ -23,6 +23,7 @@ from pea.sim.profiles import ProfileStore
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LAB4_CROPS_DIR = REPO_ROOT / "local_assets" / "benchmarks" / "lab4-crops"
+NOTO_BOLD_FONT = REPO_ROOT / "local_assets" / "fonts" / "NotoSans-Bold.ttf"
 SAMPLE_SHA256 = "35e4a257134073356c9796965ea3ea2d9362d51b2dc87486dc93e85a0fb96b15"
 
 
@@ -156,6 +157,10 @@ def rapid_ocr() -> RapidOcrBackend:
     return RapidOcrBackend(model_dir=REPO_ROOT / "local_assets" / "ocr", intra_op_num_threads=4)
 
 
+@pytest.mark.skipif(
+    not LAB4_CROPS_DIR.is_dir(),
+    reason="Optional Lab 4 benchmark crops not staged",
+)
 def test_rapid_ocr_lab4_crops_exact_value_sign_unit(rapid_ocr: RapidOcrBackend) -> None:
     assert isinstance(rapid_ocr, OcrBackend)
     assert rapid_ocr.backend_name == "rapidocr"
@@ -226,12 +231,109 @@ def test_rapid_ocr_lab4_crops_exact_value_sign_unit(rapid_ocr: RapidOcrBackend) 
         assert unit == expected_unit, f"{filename}: got unit {unit!r}"
 
 
+def _render_text_card(
+    lines: list[tuple[tuple[int, int], str]],
+    *,
+    size: tuple[int, int] = (520, 140),
+    font_size: int = 38,
+) -> Image.Image:
+    """Render high-contrast dark text on white background using bundled Noto Sans Bold."""
+    assert NOTO_BOLD_FONT.is_file(), f"Missing bundled font: {NOTO_BOLD_FONT}"
+    font = ImageFont.truetype(str(NOTO_BOLD_FONT), size=font_size)
+    img = Image.new("RGB", size, color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    for xy, text in lines:
+        draw.text(xy, text, fill=(15, 23, 42), font=font)
+    return img
+
+
+def test_rapid_ocr_synthetic_rendered_readouts(
+    rapid_ocr: RapidOcrBackend,
+    tmp_path: Path,
+) -> None:
+    """Verify real ONNX RapidOCR extracts positive/negative values and EN/RU units offline."""
+    assert isinstance(rapid_ocr, OcrBackend)
+    assert rapid_ocr.backend_name == "rapidocr"
+
+    voltage_img = _render_text_card([((40, 42), "10.00 V")], size=(360, 130), font_size=40)
+    voltage_path = tmp_path / "voltage.png"
+    voltage_img.save(voltage_path)
+
+    v_spec = ReadoutSpec(
+        name="voltage",
+        roi_px=(10, 15, 340, 115),
+        ocr_mode="det_rec",
+        pad_px=24,
+        parse_mode="float",
+        unit_pattern=r"mV|V",
+    )
+    v_res, v_val, v_unit = rapid_ocr.read_spec(voltage_path, v_spec)
+    assert v_res.backend == "rapidocr"
+    assert v_res.mode == "det_rec"
+    assert len(v_res.boxes) >= 1
+    assert v_val == pytest.approx(10.0)
+    assert v_unit == "V"
+
+    mag_img = _render_text_card([((30, 42), "-60,32 мкТл")], size=(440, 130), font_size=40)
+    mag_path = tmp_path / "magnetic.png"
+    mag_img.save(mag_path)
+
+    b_spec = ReadoutSpec(
+        name="magnetic_field",
+        roi_px=(10, 15, 420, 115),
+        ocr_mode="det_rec",
+        pad_px=24,
+        parse_mode="float",
+        unit_pattern=r"мкТл|мТл",
+    )
+    b_res, b_val, b_unit = rapid_ocr.read_spec(mag_path, b_spec)
+    assert b_res.backend == "rapidocr"
+    assert b_res.mode == "det_rec"
+    assert len(b_res.boxes) >= 1
+    assert b_val == pytest.approx(-60.32)
+    assert b_unit == "мкТл"
+
+
 def test_rapid_ocr_interleaved_use_det_stateful_bug_regression(
     rapid_ocr: RapidOcrBackend,
+    tmp_path: Path,
 ) -> None:
     """Calling rec_only (use_det=False) must NEVER corrupt subsequent det_rec (use_det=True)."""
-    wire_path = LAB4_CROPS_DIR / "wire-I-5-r2.png"
-    tight_num_crop = prepare_crop(wire_path, roi_px=(950, 280, 1145, 390), pad_px=8)
+    panel_a = _render_text_card(
+        [
+            ((30, 24), "50,0 мкТл"),
+            ((30, 94), "10.00 V"),
+            ((30, 164), "2450 c-1"),
+            ((30, 234), "3,20 Ом"),
+            ((320, 24), "1,25 мТл"),
+            ((320, 94), "5,0 мГн"),
+            ((320, 164), "32,0 мкФ"),
+            ((320, 234), "0.50 s"),
+        ],
+        size=(640, 310),
+        font_size=34,
+    )
+    panel_a_path = tmp_path / "panel_a.png"
+    panel_a.save(panel_a_path)
+
+    panel_b = _render_text_card(
+        [
+            ((30, 24), "-241,30 мкТл"),
+            ((30, 94), "-60,32 мкТл"),
+            ((30, 164), "200,0 мкТл"),
+            ((30, 234), "1.995 Hz"),
+            ((340, 24), "R = 5,0 Ом"),
+            ((340, 94), "I = 20 А"),
+            ((340, 164), "U = 10,0 В"),
+            ((340, 234), "tau = 1,00 с"),
+        ],
+        size=(680, 310),
+        font_size=34,
+    )
+    panel_b_path = tmp_path / "panel_b.png"
+    panel_b.save(panel_b_path)
+
+    tight_num_crop = prepare_crop(panel_a_path, roi_px=(20, 22, 130, 74), pad_px=8)
 
     # 1. Start with rec_only (use_det=False) to exercise rapidocr==3.10.0 stateful mutation guard
     rec1 = rapid_ocr.recognize(tight_num_crop, mode="rec_only")
@@ -239,9 +341,9 @@ def test_rapid_ocr_interleaved_use_det_stateful_bug_regression(
     assert any("50" in b.text for b in rec1.boxes), f"Unexpected rec_only output: {rec1.boxes}"
 
     # 2. Immediately call det_rec (use_det=True) on full multi-box panel
-    det1 = rapid_ocr.recognize(wire_path, mode="det_rec")
+    det1 = rapid_ocr.recognize(panel_a_path, mode="det_rec")
     assert det1.mode == "det_rec"
-    assert len(det1.boxes) >= 10, f"det_rec degraded after rec_only: only {len(det1.boxes)} boxes"
+    assert len(det1.boxes) >= 6, f"det_rec degraded after rec_only: only {len(det1.boxes)} boxes"
     assert any("50,0" in b.text for b in det1.boxes)
     assert any("мкТл" in b.text for b in det1.boxes)
 
@@ -250,9 +352,9 @@ def test_rapid_ocr_interleaved_use_det_stateful_bug_regression(
     assert rec2.mode == "rec_only"
     assert any("50" in b.text for b in rec2.boxes)
 
-    det2 = rapid_ocr.recognize(LAB4_CROPS_DIR / "loop-I-20-r2.png", mode="det_rec")
+    det2 = rapid_ocr.recognize(panel_b_path, mode="det_rec")
     assert det2.mode == "det_rec"
-    assert len(det2.boxes) >= 15
+    assert len(det2.boxes) >= 6
     assert any("-241,30" in b.text for b in det2.boxes)
 
     # 4. Blank white image handled cleanly in both modes

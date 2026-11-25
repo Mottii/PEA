@@ -18,7 +18,7 @@ Deliver both remaining **Milestone 2** capabilities — **timed transient & stop
 | **`WatchSpec` Triggers, Stops & Provenance** | Backwards-compatible extensions: `trigger_actions[]` (alongside `trigger_action`), `stability_tol`, optional threshold stop (`stop_readout` / `stop_op` / `stop_value`), `max_frames` safety cap (default `500`, cap `2000`), `blur_before_capture`, `settle_ms`, `save_dataset`, and `dataset_id`. Every captured frame is SHA-256 hashed in `provenance.jsonl`, with optional auto-save to a `simulator_captured` dataset for immediate `data_analyze` / `fft_spectrum` / `plot_render` handoff. |
 | **`compute_sim` Capabilities** | Coupled N-D `ode_ivp` via structured `state_variables` + `expressions` (backwards-compatible with single `expression` for 1D ODEs and `algebraic_grid`), selectable SciPy solver (`RK45`, `Radau`, `BDF`), and `fft_spectrum` on **both** existing run datasets (`sim_watch` / `ode_ivp` outputs) and inline expressions (with optional Hann windowing and mean detrending). All outputs are unconditionally tagged `provenance="model_computed"`. |
 | **`compute_sim` Sandboxing** | In-process zero-`eval`/`exec` AST validator & evaluator with hard resource caps: `max_nfev`, monotonic `timeout_s` checked inside the ODE RHS, `max_state_dim <= 16`, `grid_points <= 50_000`, AST depth `<= 48`, expression length `<= 1000`, exponent magnitude `<= 1000.0`, and strict non-finite rejection. |
-| **Viewer, Docs & Packaging** | Keep `pea-viewer` minimal (enrich `/api/runs/{run_id}` `datasets` metadata + compact **Datasets & Model Outputs** table with provenance pills and JSON download links, zero charting libraries), bump PEA & `.mcpb` to **`v0.3.0`** (`18` tools), and update [`skills/pea-lab-assistant/SKILL.md`](./skills/pea-lab-assistant/SKILL.md), [`README.md`](./README.md), and [`PLAN_V2.md`](./PLAN_V2.md). |
+| **Viewer, Docs & Packaging** | Keep `pea-viewer` minimal (enrich `/api/runs/{run_id}` `datasets` metadata + compact **Datasets & Model Outputs** table with provenance pills and JSON download links, zero charting libraries), bump PEA & `.mcpb` to **`v0.3.0`** (`18` tools), and update [`skills/pea-lab-assistant/SKILL.md`](../../skills/pea-lab-assistant/SKILL.md), [`README.md`](../../README.md), and [`PLAN_V2.md`](./PLAN_V2.md). |
 
 ---
 
@@ -35,14 +35,14 @@ Deliver both remaining **Milestone 2** capabilities — **timed transient & stop
 3. **Non-Uniform Timestamp Handling in `fft_spectrum`:**
    Live `sim_watch` captures exhibit small monotonic timing jitter between browser screenshot frames. Dataset-backed `fft_spectrum` must validate strictly increasing finite timestamps (`n >= 4`), measure relative spacing jitter `max(|dt_i - dt_mean|) / dt_mean`, and if jitter exceeds `1%` (`0.01`), deterministically resample onto a uniform `n`-point grid via `np.interp` while recording `resampled: true` and `dt_s` in `ComputeSimResult.solver_meta`.
 4. **Exact Version & Tool-Count Parity Touchpoints (`0.2.0` / `16` → `0.3.0` / `18`):**
-   * [`pyproject.toml`](./pyproject.toml) (`version = "0.3.0"`)
-   * [`src/pea/__init__.py`](./src/pea/__init__.py) (`__version__ = "0.3.0"`)
-   * [`src/pea/mcp_server.py`](./src/pea/mcp_server.py) (`UNIVERSAL_TOOL_NAMES` 18 tools, docstrings, `pea://policy`)
-   * [`packaging/mcpb/manifest.json`](./packaging/mcpb/manifest.json) (`version`, `long_description`, `tools[]` adding `sim_watch` & `compute_sim`)
-   * [`scripts/build_mcpb.py`](./scripts/build_mcpb.py) (replace hardcoded `16 tools` output string with `len(_expected_tool_names())`)
-   * [`tests/test_phase1_core.py`](./tests/test_phase1_core.py) (`pea.__version__ == "0.3.0"`)
-   * [`tests/test_mcp_protocol.py`](./tests/test_mcp_protocol.py) (`len(tools_res.tools) == 18`, `policy["tools_count"] == 18`)
-   * [`tests/test_sim_protocols.py`](./tests/test_sim_protocols.py) (replace `test_milestone2_protocol_stubs_raise_not_implemented` with real `sim_watch` & `compute_sim` tests)
+   * [`pyproject.toml`](../../pyproject.toml) (`version = "0.3.0"`)
+   * [`src/pea/__init__.py`](../../src/pea/__init__.py) (`__version__ = "0.3.0"`)
+   * [`src/pea/mcp_server.py`](../../src/pea/mcp_server.py) (`UNIVERSAL_TOOL_NAMES` 18 tools, docstrings, `pea://policy`)
+   * [`packaging/mcpb/manifest.json`](../../packaging/mcpb/manifest.json) (`version`, `long_description`, `tools[]` adding `sim_watch` & `compute_sim`)
+   * [`scripts/build_mcpb.py`](../../scripts/build_mcpb.py) (replace hardcoded `16 tools` output string with `len(_expected_tool_names())`)
+   * [`tests/test_phase1_core.py`](../../tests/test_phase1_core.py) (`pea.__version__ == "0.3.0"`)
+   * [`tests/test_mcp_protocol.py`](../../tests/test_mcp_protocol.py) (`len(tools_res.tools) == 18`, `policy["tools_count"] == 18`)
+   * [`tests/test_sim_protocols.py`](../../tests/test_sim_protocols.py) (replace `test_milestone2_protocol_stubs_raise_not_implemented` with real `sim_watch` & `compute_sim` tests)
 
 ---
 

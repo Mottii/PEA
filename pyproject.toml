@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.25"]
+requires = ["hatchling>=1.26"]
 build-backend = "hatchling.build"
 
 [project]
@@ -7,7 +7,28 @@ name = "pea-mcp"
 version = "0.3.0"
 description = "Physics Experiments Automation (PEA v2) — zero-API-cost deterministic MCP server, universal simulator engine, physics math, and academic report compiler."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+authors = [{ name = "PEA Contributors" }]
 requires-python = ">=3.12,<3.14"
+keywords = [
+    "physics",
+    "laboratory",
+    "mcp",
+    "simulator",
+    "ocr",
+    "scientific-computing",
+    "reports",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Physics",
+]
 dependencies = [
     "mcp",
     "pydantic>=2.10",
@@ -34,6 +55,12 @@ dev = [
     "ruff",
 ]
 
+[project.urls]
+Homepage = "https://github.com/Mottii/PEA"
+Repository = "https://github.com/Mottii/PEA"
+Issues = "https://github.com/Mottii/PEA/issues"
+Changelog = "https://github.com/Mottii/PEA/blob/main/CHANGELOG.md"
+
 [project.scripts]
 pea-mcp = "pea.mcp_server:main"
 pea-viewer = "pea.viewer.app:main"
@@ -51,7 +78,7 @@ markers = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py313"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B"]
