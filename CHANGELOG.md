@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.1] — 2026-11-25
+
+### Added
+
+- **Unified `pea` CLI (`pea setup`, `pea demo`, `pea viewer`, `pea mcp`):**
+  - `pea demo` runs the self-contained HTML5 RC discharge & damped RLC transient pipeline over real MCP stdio and launches `pea-viewer` (`--no-viewer`, `--no-browser`, `--out` supported), replacing `pytest` as the quick-start demo.
+  - `pea setup` fetches and SHA-256-verifies all four pinned offline asset groups and ensures Playwright Chromium is installed (`--check`, `--skip-browser`, `--with-deps`).
+  - Added `--runs-dir` CLI option to `pea-viewer`.
+- **PyPI / `uvx` Packaging Readiness (`pea.assets`, `pea.demo_assets`, `default_cache_dir`):**
+  - Moved the offline asset manager into the installable `pea.assets` module (keeping `scripts/fetch_assets.py` as a compatibility wrapper).
+  - Bundled the open-source HTML5 RC/RLC fixture inside `pea.demo_assets` and decoupled `PeaConfig` so non-checkout installs resolve `local_assets` from the OS user cache directory (`default_cache_dir`).
+- **Animated README Demo (`docs/images/demo-run.gif`):**
+  - Added a self-contained visual walkthrough generated from the open-source HTML5 RC/RLC benchmark.
+
+### Changed
+
+- **Documentation, Integrity & Academic Framing:**
+  - Rewrote the `README.md` opening around the Flash (`.swf`) / HTML5 physics lab automation workflow, added an **Academic Integrity & Intended Use** section, and clarified that `provenance.jsonl` is a local SHA-256 artifact integrity manifest for detecting corruption or drift.
+  - Updated `SECURITY.md`, `skills/pea-lab-assistant/SKILL.md`, and `pea-viewer` labels (`SHA-256 Artifact Integrity Manifest`, `Instructor Audit PDF`).
+- **Cross-Platform ZWS & Live E2E Hardening (post-`v0.3.0`):**
+  - Fixed ZWS SWF header decoding across `liblzma` versions using `lzma.FORMAT_RAW` (`src/pea/sim/swf_meta.py`).
+  - Hardened live HTML5 E2E OCR & `sim_watch` timestamp handling for cross-platform CI.
+
+---
+
 ## [0.3.0] — 2026-11-24
 
 ### Added

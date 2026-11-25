@@ -2,9 +2,9 @@
   "manifest_version": "0.3",
   "name": "pea-mcp",
   "display_name": "PEA — Physics Experiments Automation",
-  "version": "0.3.0",
-  "description": "Zero-API-cost deterministic physics lab simulator control, timed transient capture, offline ONNX OCR, dimensional math, OLS analysis, sandboxed ODE/FFT modeling, vector plots/schematics, and academic PDF/DOCX report compiler.",
-  "long_description": "PEA v2 connects Claude Desktop to a local Python 3.13 PEA workspace over MCP stdio with zero LLM API calls and zero API keys required. Exposes 18 universal laboratory tools and the read-only pea://policy resource.",
+  "version": "0.3.1",
+  "description": "Zero-API-cost deterministic physics lab simulator control, timed transient capture, offline ONNX OCR, dimensional math, OLS analysis, sandboxed ODE/FFT modeling, vector plots/schematics, and structured academic report compiler.",
+  "long_description": "PEA v2 connects Claude Desktop to a local Python 3.12–3.13 PEA workspace over MCP stdio with zero LLM API calls and zero API keys required. Exposes 18 universal laboratory tools and the read-only pea://policy resource.",
   "author": {
     "name": "PEA Contributors"
   },

@@ -19,12 +19,9 @@ uv venv .venv --python 3.13
 # 2. Install PEA in editable mode with dev dependencies
 uv pip install --python .venv/bin/python -e ".[dev]"
 
-# 3. Install Playwright Chromium
-.venv/bin/playwright install chromium
-
-# 4. Fetch & SHA-256-verify pinned offline assets (KaTeX, RapidOCR ONNX, Ruffle 0.7.1, Noto Sans)
-.venv/bin/python scripts/fetch_assets.py --fetch
-.venv/bin/python scripts/fetch_assets.py --check
+# 3. Fetch & verify pinned offline assets and install Playwright Chromium
+.venv/bin/pea setup
+# (Or run individually: .venv/bin/playwright install chromium && .venv/bin/python scripts/fetch_assets.py --fetch)
 ```
 
 ### Windows (PowerShell)

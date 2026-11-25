@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>PEA RC / RLC Transient Fixture</title>
+  <link
+    rel="icon"
+    type="image/svg+xml"
+    href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%231e293b'/%3E%3C/svg%3E"
+  />
+  <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 640px;
+      height: 420px;
+      overflow: hidden;
+      background: #f1f5f9;
+      color: #0f172a;
+      font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+      user-select: none;
+    }
+    .stage {
+      position: relative;
+      width: 640px;
+      height: 420px;
+      overflow: hidden;
+    }
+    .topbar {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 640px;
+      height: 36px;
+      background: #1e293b;
+      color: #ffffff;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+    .topbar-sub {
+      font-size: 11px;
+      font-weight: 500;
+      color: #cbd5e1;
+    }
+    .panel {
+      position: absolute;
+      left: 20px;
+      width: 600px;
+      background: #ffffff;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+    }
+    .controls-panel {
+      top: 48px;
+      height: 120px;
+    }
+    .param-label {
+      position: absolute;
+      top: 18px;
+      height: 32px;
+      line-height: 32px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #334155;
+    }
+    .param-input {
+      position: absolute;
+      top: 18px;
+      width: 84px;
+      height: 32px;
+      padding: 0 8px;
+      border: 2px solid #94a3b8;
+      border-radius: 6px;
+      background: #ffffff;
+      color: #0f172a;
+      font-family: ui-monospace, "SFMono-Regular", "DejaVu Sans Mono", "Liberation Mono", Menlo, Consolas, monospace;
+      font-size: 15px;
+      font-weight: 700;
+      text-align: right;
+    }
+    .param-input:focus {
+      outline: 2px solid #1f4e79;
+      border-color: #1f4e79;
+    }
+    .btn {
+      position: absolute;
+      top: 68px;
+      width: 112px;
+      height: 36px;
+      border-radius: 6px;
+      border: 2px solid #94a3b8;
+      background: #f8fafc;
+      color: #0f172a;
+      font-family: inherit;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .btn.active-mode {
+      background: #1f4e79;
+      border-color: #1f4e79;
+      color: #ffffff;
+    }
+    .btn-primary {
+      background: #166534;
+      border-color: #166534;
+      color: #ffffff;
+    }
+    .btn-reset {
+      background: #e2e8f0;
+      border-color: #64748b;
+      color: #0f172a;
+    }
+    .readouts-panel {
+      top: 182px;
+      height: 222px;
+    }
+    .ro-label {
+      position: absolute;
+      top: 18px;
+      width: 264px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #334155;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .ro-box {
+      position: absolute;
+      top: 46px;
+      width: 264px;
+      height: 92px;
+      background: #ffffff;
+      border: 2px solid #94a3b8;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 18px;
+      font-family: ui-monospace, "SFMono-Regular", "DejaVu Sans Mono", "Liberation Mono", Menlo, Consolas, monospace;
+      font-size: 32px;
+      font-weight: 700;
+      color: #0f172a;
+      letter-spacing: 0.06em;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .status-bar {
+      position: absolute;
+      left: 18px;
+      right: 18px;
+      bottom: 16px;
+      height: 44px;
+      padding: 0 14px;
+      border-radius: 6px;
+      background: #f8fafc;
+      border: 1px solid #cbd5e1;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 13px;
+      font-weight: 600;
+      color: #334155;
+    }
+    .state-pill {
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      background: #e2e8f0;
+      color: #1e293b;
+    }
+    .state-pill.running {
+      background: #dcfce7;
+      color: #166534;
+    }
+  </style>
+</head>
+<body>
+  <div class="stage">
+    <header class="topbar" id="topbar">
+      <span>PEA RC / RLC Transient Fixture</span>
+      <span class="topbar-sub">640 x 420 · Deterministic Loopback</span>
+    </header>
+
+    <section class="panel controls-panel" aria-label="Circuit Parameters">
+      <label class="param-label" for="input-r" style="left: 18px;">R (k&Omega;)</label>
+      <input class="param-input" id="input-r" type="text" value="10.0" style="left: 88px;" />
+
+      <label class="param-label" for="input-c" style="left: 204px;">C (&micro;F)</label>
+      <input class="param-input" id="input-c" type="text" value="100.0" style="left: 274px;" />
+
+      <label class="param-label" for="input-v0" style="left: 392px;">V0 (V)</label>
+      <input class="param-input" id="input-v0" type="text" value="10.0" style="left: 462px;" />
+
+      <button type="button" class="btn active-mode" id="mode-rc" style="left: 18px;">RC</button>
+      <button type="button" class="btn" id="mode-rlc" style="left: 146px;">RLC</button>
+      <button type="button" class="btn btn-reset" id="btn-reset" style="left: 340px;">Reset</button>
+      <button type="button" class="btn btn-primary" id="btn-start" style="left: 468px;">Start</button>
+    </section>
+
+    <section class="panel readouts-panel" aria-label="Live Readouts">
+      <div class="ro-label" style="left: 18px;">Stopwatch t</div>
+      <div class="ro-box" id="readout-t" style="left: 18px;">0.00 s</div>
+
+      <div class="ro-label" style="left: 318px;">Capacitor Voltage Vc</div>
+      <div class="ro-box" id="readout-vc" style="left: 318px;">10.00 V</div>
+
+      <div class="status-bar">
+        <span id="mode-caption">Mode: RC Discharge (tau = 1.00 s)</span>
+        <span id="state-pill" class="state-pill">IDLE</span>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    (function () {
+      "use strict";
+
+      const RLC_F0_HZ = 2.0;
+      const RLC_BETA_S = 0.25;
+
+      const inputR = document.getElementById("input-r");
+      const inputC = document.getElementById("input-c");
+      const inputV0 = document.getElementById("input-v0");
+      const btnRc = document.getElementById("mode-rc");
+      const btnRlc = document.getElementById("mode-rlc");
+      const btnReset = document.getElementById("btn-reset");
+      const btnStart = document.getElementById("btn-start");
+      const roT = document.getElementById("readout-t");
+      const roVc = document.getElementById("readout-vc");
+      const modeCaption = document.getElementById("mode-caption");
+      const statePill = document.getElementById("state-pill");
+
+      const sim = {
+        mode: "rc",
+        R_kohm: 10.0,
+        C_uF: 100.0,
+        V0: 10.0,
+        running: false,
+        startPerfMs: 0,
+        elapsedS: 0.0,
+      };
+
+      function parsePositive(el, fallback, minVal, maxVal) {
+        const raw = String(el.value || "").trim().replace(",", ".");
+        const parsed = Number.parseFloat(raw);
+        if (!Number.isFinite(parsed)) return fallback;
+        return Math.min(maxVal, Math.max(minVal, parsed));
+      }
+
+      function applyParams() {
+        sim.R_kohm = parsePositive(inputR, sim.R_kohm, 0.1, 1000.0);
+        sim.C_uF = parsePositive(inputC, sim.C_uF, 0.1, 10000.0);
+        sim.V0 = parsePositive(inputV0, sim.V0, 0.1, 100.0);
+        inputR.value = sim.R_kohm.toFixed(1);
+        inputC.value = sim.C_uF.toFixed(1);
+        inputV0.value = sim.V0.toFixed(1);
+        updateCaption();
+        renderReadouts();
+      }
+
+      function computeTauS() {
+        return Math.max(0.01, (sim.R_kohm * 1e3) * (sim.C_uF * 1e-6));
+      }
+
+      function computeVoltage(t) {
+        if (sim.mode === "rlc") {
+          return sim.V0 * Math.exp(-RLC_BETA_S * t) * Math.cos(2 * Math.PI * RLC_F0_HZ * t);
+        }
+        return sim.V0 * Math.exp(-t / computeTauS());
+      }
+
+      function updateCaption() {
+        if (sim.mode === "rlc") {
+          modeCaption.textContent = "Mode: Damped RLC (f0 = 2.00 Hz, beta = 0.25 s^-1)";
+        } else {
+          modeCaption.textContent = `Mode: RC Discharge (tau = ${computeTauS().toFixed(2)} s)`;
+        }
+        statePill.textContent = sim.running ? "RUNNING" : "IDLE";
+        statePill.classList.toggle("running", sim.running);
+        btnRc.classList.toggle("active-mode", sim.mode === "rc");
+        btnRlc.classList.toggle("active-mode", sim.mode === "rlc");
+      }
+
+      function renderReadouts() {
+        const t = Math.max(0.0, sim.elapsedS);
+        let vc = computeVoltage(t);
+        if (Math.abs(vc) < 0.005) vc = 0.0;
+        roT.textContent = `${t.toFixed(2)} s`;
+        roVc.textContent = `${vc.toFixed(2)} V`;
+      }
+
+      function tick(nowMs) {
+        if (sim.running) {
+          sim.elapsedS = Math.max(0.0, (nowMs - sim.startPerfMs) / 1000.0);
+          renderReadouts();
+        }
+        window.requestAnimationFrame(tick);
+      }
+
+      function resetSim() {
+        sim.running = false;
+        sim.elapsedS = 0.0;
+        updateCaption();
+        renderReadouts();
+      }
+
+      function startSim() {
+        applyParams();
+        sim.running = true;
+        sim.startPerfMs = performance.now() - sim.elapsedS * 1000.0;
+        updateCaption();
+        renderReadouts();
+      }
+
+      for (const el of [inputR, inputC, inputV0]) {
+        el.addEventListener("change", applyParams);
+        el.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter") {
+            applyParams();
+            el.blur();
+          }
+        });
+      }
+
+      btnRc.addEventListener("click", () => {
+        sim.mode = "rc";
+        resetSim();
+      });
+
+      btnRlc.addEventListener("click", () => {
+        sim.mode = "rlc";
+        resetSim();
+      });
+
+      btnReset.addEventListener("click", resetSim);
+      btnStart.addEventListener("click", startSim);
+
+      // Periodic fallback alongside rAF in case headless frame callbacks coalesce.
+      window.setInterval(() => {
+        if (sim.running) {
+          sim.elapsedS = Math.max(0.0, (performance.now() - sim.startPerfMs) / 1000.0);
+          renderReadouts();
+        }
+      }, 16);
+
+      applyParams();
+      window.requestAnimationFrame(tick);
+    })();
+  </script>
+</body>
+</html>

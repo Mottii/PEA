@@ -785,6 +785,12 @@ def main(argv: list[str] | None = None) -> int:
         help=f"Local TCP port to bind (default: {cfg.viewer_port}).",
     )
     parser.add_argument(
+        "--runs-dir",
+        type=Path,
+        default=None,
+        help="Override runs directory to inspect (default: PEA_RUNS_DIR or <project>/runs).",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"pea-viewer {__version__}",
@@ -800,10 +806,14 @@ def main(argv: list[str] | None = None) -> int:
 
     import uvicorn
 
+    effective_runs_dir = (
+        args.runs_dir.expanduser().resolve() if args.runs_dir is not None else cfg.runs_dir
+    )
+
     effective_cfg = PeaConfig(
         project_root=cfg.project_root,
         local_assets_dir=cfg.local_assets_dir,
-        runs_dir=cfg.runs_dir,
+        runs_dir=effective_runs_dir,
         profiles_dir=cfg.profiles_dir,
         loopback_host=args.host,
         viewer_port=args.port,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,13 +91,28 @@ def parse_allowed_origins(raw: str | None) -> tuple[str, ...]:
     return tuple(origins)
 
 
+def default_cache_dir(env: Mapping[str, str] | None = None) -> Path:
+    """Return the user-level PEA cache directory across macOS, Linux, and Windows."""
+    source_env = os.environ if env is None else env
+    xdg = source_env.get("XDG_CACHE_HOME", "").strip()
+    if xdg:
+        return Path(xdg).expanduser() / "pea"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "pea"
+    if sys.platform == "win32":
+        local_app = source_env.get("LOCALAPPDATA", "").strip()
+        base = Path(local_app).expanduser() if local_app else (Path.home() / "AppData" / "Local")
+        return base / "pea" / "Cache"
+    return Path.home() / ".cache" / "pea"
+
+
 def _discover_project_root() -> Path:
-    """Locate the PEA repository root by searching upward for ``pyproject.toml``."""
+    """Locate the PEA source checkout root, or fall back to the current working directory."""
     here = Path(__file__).resolve()
     for parent in here.parents:
-        if (parent / "pyproject.toml").is_file():
+        if (parent / "pyproject.toml").is_file() and (parent / "src" / "pea").is_dir():
             return parent
-    return here.parents[2]
+    return Path.cwd().resolve()
 
 
 def _chromium_revision_key(dir_path: Path) -> tuple[int, str]:
@@ -253,7 +269,15 @@ class PeaConfig:
                 return default
             return Path(raw).expanduser().resolve()
 
-        local_assets_dir = _path_from_env("PEA_LOCAL_ASSETS_DIR", project_root / "local_assets")
+        raw_assets_override = source_env.get("PEA_LOCAL_ASSETS_DIR", "").strip()
+        if raw_assets_override:
+            local_assets_dir = Path(raw_assets_override).expanduser().resolve()
+        elif (project_root / "local_assets").is_dir():
+            local_assets_dir = project_root / "local_assets"
+        elif root_override or (project_root / "pyproject.toml").is_file():
+            local_assets_dir = project_root / "local_assets"
+        else:
+            local_assets_dir = default_cache_dir(source_env) / "local_assets"
         runs_dir = _path_from_env("PEA_RUNS_DIR", project_root / "runs")
         profiles_dir = _path_from_env("PEA_PROFILES_DIR", project_root / "profiles")
 
@@ -349,6 +373,7 @@ __all__ = [
     "OcrBackendName",
     "PathConfinementError",
     "PeaConfig",
+    "default_cache_dir",
     "is_loopback_host",
     "is_origin_allowed",
     "normalize_origin",

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pea-mcp"
-version = "0.3.0"
+version = "0.3.1"
 description = "Physics Experiments Automation (PEA v2) — zero-API-cost deterministic MCP server, universal simulator engine, physics math, and academic report compiler."
 readme = "README.md"
 license = "MIT"
@@ -62,6 +62,7 @@ Issues = "https://github.com/Mottii/PEA/issues"
 Changelog = "https://github.com/Mottii/PEA/blob/main/CHANGELOG.md"
 
 [project.scripts]
+pea = "pea.cli:main"
 pea-mcp = "pea.mcp_server:main"
 pea-viewer = "pea.viewer.app:main"
 

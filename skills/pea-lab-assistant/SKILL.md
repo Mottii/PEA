@@ -1,13 +1,13 @@
 ---
 name: pea-lab-assistant
-description: Universal physics laboratory assistant workflow for the zero-API-cost pea-mcp server. Guides PDF handout inspection, team/variant confirmation, SHA-256 simulator calibration, verified data acquisition (sweeps, extremum/plateau searches, and timed transient capture), dimensional physics math, sandboxed ODE/FFT modeling, vector plots/schematics, submission-ready PDF/DOCX compilation, and visual QA.
+description: Universal physics laboratory assistant workflow for the zero-API-cost pea-mcp server. Guides PDF handout inspection, team/variant confirmation, SHA-256 simulator calibration, verified data acquisition (sweeps, extremum/plateau searches, and timed transient capture), dimensional physics math, sandboxed ODE/FFT modeling, vector plots/schematics, structured PDF/DOCX report drafting, instructor verification packets, and visual QA.
 ---
 
 # PEA v2 Lab Assistant Skill
 
 Use this skill whenever executing a university physics laboratory experiment, analyzing bench or simulator data, or compiling a physics lab report through the **`pea-mcp`** MCP server.
 
-**Core Operating Principle:** PEA v2 is a **zero-API-cost deterministic local toolkit**. You (the host AI agent) provide multimodal handout reading, experimental planning, visual coordinate calibration, and scientific prose. **`pea-mcp`** executes all browser/simulator interaction, offline ONNX OCR, dimensional calculations, OLS regressions, vector rendering, PDF/DOCX compilation, and SHA-256 provenance tracking.
+**Core Operating Principle:** PEA v2 is a **zero-API-cost deterministic local toolkit**. You (the host AI agent) provide multimodal handout reading, experimental planning, visual coordinate calibration, and structured scientific drafting. **`pea-mcp`** executes all browser/simulator interaction, offline ONNX OCR, dimensional calculations, OLS regressions, vector rendering, PDF/DOCX compilation, and SHA-256 artifact integrity tracking.
 
 ---
 
@@ -20,7 +20,8 @@ Use this skill whenever executing a university physics laboratory experiment, an
    - `model_computed` — theoretical formulas, fits, schematics, or numerical models.
 3. **Zero mental arithmetic.** Run every formula, unit conversion, complex AC impedance, 3D vector operation, and uncertainty propagation through **`calc_eval`** (attached to `run_id` so every result receives an immutable `calc_id` in `calculations.jsonl`), and run every column transformation and linear regression through **`data_analyze`**.
 4. **Never claim independent manual verification automatically.** Record only what was actually measured and verified; leave any manual instructor/student sign-off blank unless explicitly confirmed by the user.
-5. **Respect loopback & path confinement.** Local SWF/HTML5 simulators run strictly on loopback (`127.0.0.1`) with Ruffle `allowScriptAccess: false` and `allowNetworking: "none"`. Never attempt path traversal (`..`) or external URLs not listed in `PEA_ALLOWED_ORIGINS`.
+5. **Respect academic integrity and human authorship.** PEA provides reproducible data acquisition, auditable calculations, and report scaffolding (plus `evidence.zip` / `teacher-evidence.pdf` instructor verification packets). Keep the student/researcher in the loop on theory framing and interpretation rather than claiming automated homework completion.
+6. **Respect loopback & path confinement.** Local SWF/HTML5 simulators run strictly on loopback (`127.0.0.1`) with Ruffle `allowScriptAccess: false` and `allowNetworking: "none"`. Never attempt path traversal (`..`) or external URLs not listed in `PEA_ALLOWED_ORIGINS`.
 
 ---
 
@@ -84,7 +85,7 @@ Before acquiring data or compiling the final report, confirm with the user:
 - Call **`plot_render`** to generate vector `.svg` + 300 DPI `.png` plots (linearized fits with regression annotations, resonance curves, error bars, or `equal_aspect=True` phase portraits such as $q$–$I$ ellipses).
 - Call **`diagram_render`** to generate redrawn `schemdraw` circuit schematics (`kind="circuit"`), phasor/impedance/waveform diagrams (`kind="phasor"`), or magnetic/electric field diagrams (`kind="field"`).
 
-### Stage 7 — Submission-Ready Report Compilation (`report_build`)
+### Stage 7 — Structured Report Compilation (`report_build`)
 Call **`report_build(run_id=..., spec=ReportSpec(...), formats=..., include_teacher_packet=...)`**:
 - Populate clean academic prose (`objective`, `apparatus`, `theory_sections`, `procedure`, `analysis_paragraphs`, `conclusions`) with standard LaTeX math (`$...$` and `$$...$$`, including multi-line `\begin{aligned}...\end{aligned}`).
 - Include only verified `tables`, `figures`, and `calc_ids`.

@@ -200,7 +200,7 @@
       { label: "Report PDF", url: downloads.pdf_url, primary: true, download: false },
       { label: "Editable DOCX", url: downloads.docx_url, primary: false, download: true },
       { label: "Evidence ZIP", url: downloads.evidence_zip_url, primary: false, download: true },
-      { label: "Teacher Evidence PDF", url: downloads.teacher_packet_url, primary: false, download: false },
+      { label: "Instructor Audit PDF", url: downloads.teacher_packet_url, primary: false, download: false },
     ];
 
     for (const item of entries) {

@@ -81,7 +81,7 @@ def test_python_runtime_and_version() -> None:
     assert (3, 12) <= sys.version_info[:2] < (3, 14), (
         f"Expected Python 3.12 or 3.13, got {sys.version}"
     )
-    assert pea.__version__ == "0.3.0"
+    assert pea.__version__ == "0.3.1"
 
 
 @pytest.mark.parametrize(

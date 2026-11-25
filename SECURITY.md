@@ -29,6 +29,9 @@ PEA is designed to run deterministically on a local workstation with a minimal a
   - Expressions are parsed and evaluated via an explicit AST allowlist (never `eval()`/`exec()`), blocking attribute/dunder access and enforcing expression length, AST depth, exponent magnitude, ODE `max_nfev`, and wall-clock `timeout_s` caps.
 - **Audited `.mcpb` Packaging (`scripts/build_mcpb.py`):**
   - The Claude Desktop `.mcpb` archive is audited before release to guarantee zero path traversal, zero symlinks, zero bundled binaries/SWFs/PDFs/ONNX/WASM payloads, zero literal host home paths, and zero secret patterns.
+- **SHA-256 Artifact Integrity Manifest (`provenance.jsonl`):**
+  - Every recorded artifact's SHA-256 digest and byte size is checked against disk via `lab_runs(action="verify")` to detect accidental corruption, stale artifacts, or drift during analysis.
+  - Because `provenance.jsonl` is stored locally on the user's filesystem without an external signing authority, it provides integrity and reproducibility verification rather than cryptographic tamper-proofing against the machine owner.
 
 ---
 

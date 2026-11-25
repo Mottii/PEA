@@ -120,7 +120,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: local_assets
-          key: local-assets-${{ hashFiles('scripts/fetch_assets.py') }}
+          key: local-assets-${{ hashFiles('src/pea/assets.py', 'scripts/fetch_assets.py') }}
 
       - name: Fetch and verify pinned offline assets
         run: |
@@ -175,7 +175,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: local_assets
-          key: local-assets-${{ hashFiles('scripts/fetch_assets.py') }}
+          key: local-assets-${{ hashFiles('src/pea/assets.py', 'scripts/fetch_assets.py') }}
 
       - name: Fetch and verify pinned offline assets
         run: |
