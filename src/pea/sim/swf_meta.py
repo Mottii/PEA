@@ -14,6 +14,7 @@ from pea.workspace import sha256_file
 _TWIPS_PER_PIXEL = 20
 _HEADER_PREFIX_BYTES = 8
 _MAX_DECOMPRESSED_HEADER_BYTES = 128
+_MAX_ZWS_DICT_SIZE_BYTES = 256 * 1024 * 1024
 
 
 class SwfFormatError(ValueError):
@@ -59,6 +60,27 @@ class _BitReader:
         return unsigned
 
 
+def _decode_lzma1_props(lzma_props: bytes) -> dict[str, int]:
+    """Decode a 5-byte LZMA1 properties block (1B lc/lp/pb + 4B LE dict_size)."""
+    if len(lzma_props) != 5:
+        raise SwfFormatError(f"Invalid ZWS LZMA properties length: {len(lzma_props)}")
+    prop_byte = lzma_props[0]
+    if prop_byte >= 225:
+        raise SwfFormatError(f"Invalid ZWS LZMA properties byte: {prop_byte}")
+    lc = prop_byte % 9
+    rem = prop_byte // 9
+    lp = rem % 5
+    pb = rem // 5
+    if lc + lp > 4:
+        raise SwfFormatError(
+            f"Unsupported ZWS LZMA properties (lc={lc}, lp={lp}, pb={pb})"
+        )
+    dict_size = struct.unpack_from("<I", lzma_props, 1)[0]
+    if dict_size > _MAX_ZWS_DICT_SIZE_BYTES:
+        raise SwfFormatError(f"ZWS LZMA dictionary size exceeds limit: {dict_size}")
+    return {"id": lzma.FILTER_LZMA1, "lc": lc, "lp": lp, "pb": pb, "dict_size": dict_size}
+
+
 def _decompress_header_body(
     signature: Literal["FWS", "CWS", "ZWS"],
     file_length: int,
@@ -77,17 +99,26 @@ def _decompress_header_body(
             raise SwfFormatError("Empty decompressed body in CWS SWF header")
         return body
 
-    # ZWS layout after byte 8: uint32 compressed_len (4B) + LZMA props (5B) + raw LZMA stream.
+    # ZWS layout after byte 8: uint32 compressed_len (4B) + LZMA props (5B) + raw LZMA1 stream.
     if len(raw_tail) < 10:
         raise SwfFormatError("Truncated ZWS LZMA header")
+    compressed_len = struct.unpack_from("<I", raw_tail, 0)[0]
+    if compressed_len == 0:
+        raise SwfFormatError("Zero compressed length in ZWS LZMA header")
     lzma_props = raw_tail[4:9]
-    lzma_stream = raw_tail[9:]
+    lzma_stream = raw_tail[9 : 9 + compressed_len]
     uncompressed_body_len = max(0, file_length - _HEADER_PREFIX_BYTES)
-    alone_payload = lzma_props + struct.pack("<Q", uncompressed_body_len) + lzma_stream
+    max_header_bytes = min(uncompressed_body_len, _MAX_DECOMPRESSED_HEADER_BYTES)
+    if max_header_bytes <= 0:
+        raise SwfFormatError("Empty decompressed body in ZWS SWF header")
+    lzma_filter = _decode_lzma1_props(lzma_props)
     try:
-        decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_ALONE)
-        body = decompressor.decompress(alone_payload, max_length=_MAX_DECOMPRESSED_HEADER_BYTES)
-    except lzma.LZMAError as exc:
+        decompressor = lzma.LZMADecompressor(
+            format=lzma.FORMAT_RAW,
+            filters=[lzma_filter],
+        )
+        body = decompressor.decompress(lzma_stream, max_length=max_header_bytes)
+    except (lzma.LZMAError, ValueError) as exc:
         raise SwfFormatError(f"Corrupted ZWS LZMA stream: {exc}") from exc
     if not body:
         raise SwfFormatError("Empty decompressed body in ZWS SWF header")

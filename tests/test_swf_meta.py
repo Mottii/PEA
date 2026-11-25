@@ -136,6 +136,42 @@ def test_inspect_synthetic_fws_cws_zws_and_signed_offsets(tmp_path: Path, sig: b
     assert meta.sha256 == hashlib.sha256(raw).hexdigest()
 
 
+@pytest.mark.parametrize("trailing_bytes", [b"", b"\xde\xad\xbe\xef"])
+def test_inspect_synthetic_zws_custom_props_and_large_payload(
+    tmp_path: Path, trailing_bytes: bytes
+) -> None:
+    rect = _encode_rect_twips(0, 1024 * 20, 0, 768 * 20)
+    raw_fps = int(round(60.0 * 256))
+    body = rect + struct.pack("<HH", raw_fps, 48) + bytes(range(256)) * 10
+    assert len(body) > 2048
+
+    lc, lp, pb, dict_size = 2, 1, 1, 65536
+    custom_filter = {
+        "id": lzma.FILTER_LZMA1,
+        "lc": lc,
+        "lp": lp,
+        "pb": pb,
+        "dict_size": dict_size,
+    }
+    props = bytes([lc + lp * 9 + pb * 45]) + struct.pack("<I", dict_size)
+    raw_stream = lzma.compress(body, format=lzma.FORMAT_RAW, filters=[custom_filter])
+    prefix = b"ZWS" + bytes([19]) + struct.pack("<I", 8 + len(body))
+    raw = prefix + struct.pack("<I", len(raw_stream)) + props + raw_stream + trailing_bytes
+
+    swf_file = tmp_path / f"custom_large_{len(trailing_bytes)}.swf"
+    swf_file.write_bytes(raw)
+
+    meta = inspect_swf(swf_file)
+    assert meta.signature == "ZWS"
+    assert meta.compressed is True
+    assert meta.swf_version == 19
+    assert meta.stage_width == 1024
+    assert meta.stage_height == 768
+    assert meta.fps == pytest.approx(60.0)
+    assert meta.frame_count == 48
+    assert meta.sha256 == hashlib.sha256(raw).hexdigest()
+
+
 def test_inspect_swf_rejects_missing_and_corrupted_headers(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         inspect_swf(tmp_path / "missing.swf")
@@ -146,6 +182,31 @@ def test_inspect_swf_rejects_missing_and_corrupted_headers(tmp_path: Path) -> No
         ("version_zero.swf", b"FWS\x00" + struct.pack("<I", 100) + b"\x00" * 32),
         ("corrupt_zlib.swf", b"CWS\x09" + struct.pack("<I", 100) + b"\xff\xfe\xfd\xfc"),
         ("corrupt_lzma.swf", b"ZWS\x0f" + struct.pack("<II", 100, 10) + b"\x5d\x00\x00\x00\x00bad"),
+        ("zws_truncated_header.swf", b"ZWS\x0f" + struct.pack("<I", 20) + b"\x01\x00\x00\x00\x5d"),
+        (
+            "zws_zero_compressed_len.swf",
+            b"ZWS\x0f" + struct.pack("<II", 100, 0) + b"\x5d\x00\x00\x80\x00\x00",
+        ),
+        (
+            "zws_bad_prop_byte.swf",
+            b"ZWS\x0f" + struct.pack("<II", 100, 10) + b"\xff\x00\x00\x80\x00\x00",
+        ),
+        (
+            "zws_invalid_lc_lp.swf",
+            b"ZWS\x0f"
+            + struct.pack("<II", 100, 10)
+            + bytes([4 + 1 * 9])
+            + struct.pack("<I", 4096)
+            + b"\x00",
+        ),
+        (
+            "zws_huge_dict.swf",
+            b"ZWS\x0f"
+            + struct.pack("<II", 100, 10)
+            + b"\x5d"
+            + struct.pack("<I", 512 * 1024 * 1024)
+            + b"\x00",
+        ),
         (
             "zero_stage.swf",
             b"FWS\x09"
